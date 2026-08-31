@@ -1,6 +1,6 @@
 //
 //  kernel.s
-//  16ForthCLI
+//  16Forth
 //
 //  Minimal 64Forth-derived kernel — memory data stack (no TOS-in-register)
 //
@@ -39,6 +39,10 @@
 .equ FL_IMM,     1
 .equ FL_INLINE,  2
 .equ FFA_INLINE, 62              // FFA bit 62
+// Search-Order: heads per wid (1 = single chain; raise later for hashing).
+.equ DICT_THREADS, 1
+.equ WORDLIST_REG_MAX, 128
+.equ SEARCH_ORDER_MAX, 8
 
 // NEXT — inner interpreter dispatch
 // Typical M-series, L1 I/D hit, predicted indirect branch:
@@ -122,7 +126,17 @@ name_buf:       .skip 256
 
 .align 3
 here_ptr:       .quad user_dict
+// FORTH-WORDLIST = &latest_var (DICT_THREADS head cells)
 latest_var:     .quad 0
+                .space (DICT_THREADS - 1) * 8
+current_var:    .quad 0          // compilation wid
+search_order:   .space SEARCH_ORDER_MAX * 8
+search_order_n: .quad 0
+wordlist_reg:   .space WORDLIST_REG_MAX * 8
+wordlist_reg_n: .quad 0
+// TRAVERSE-WORDLIST visitor return: IP → tw_continue_cell → tw_continue_cfa → XTW_CONTINUE
+tw_continue_cfa:  .quad 0
+tw_continue_cell: .quad 0
 state_var:      .quad 0
 base_var:       .quad 10
 last_cfa:       .quad 0
@@ -147,8 +161,45 @@ interp_lr:      .quad 0
 in_interpret:   .quad 0          // 1 while _interpret_run is active
 embed_mode:     .quad 0          // 1 = GUI/host eval (QUIT/ABORT return to C, no readline)
 embed_c_sp:     .quad 0          // C SP after SAVE_C_CALLEE in kernel_eval (abort unwind)
+.align 3
+timeval_buf:    .quad 0, 0       // gettimeofday scratch (avoid SP timeval)
+timespec_buf:   .quad 0, 0       // nanosleep scratch
+ms_remain:      .quad 0          // MS remaining ms across nanosleep
+pending_help_addr: .quad 0       // SETDOC / DOC" → next : / I: / CREATE
+pending_help_len:  .quad 0
+.align 3
+pending_help_buf:  .space 256    // NUL-terminated copy for _header_build
+source_id_var:  .quad 0          // 0=user/eval, -1=EVALUATE, 1=malloc INCLUDE, 2=host INCLUDE
+.equ SRC_MAX, 8
+.equ SRC_FRAME, 40               // addr,len,>IN,id,file_echo_pos
+.equ SRCID_EVAL, -1
+.equ SRCID_MALLOC, 1
+.equ SRCID_HOST, 2
+source_sp:      .quad 0
+file_echo_pos:  .quad 0
+file_echo_var:  .quad 0          // FILE-ECHO variable cell
+repl_batch_stop: .quad 0
+.align 3
+source_stack:   .space (SRC_MAX * SRC_FRAME)
+.equ INCL_MAX, 64
+.equ INCL_NAME, 256
+included_count: .quad 0
+.align 3
+included_names: .space (INCL_MAX * INCL_NAME)  // counted strings
+include_path_len: .quad 0        // pending path length in name_buf
+resolve_key_buf: .space INCL_NAME
 file_o1:        .quad 0
 file_o2:        .quad 0
+// Host hooks (INCLUDE / FROMLIB / cwd)
+load_file_hook:     .quad 0
+resolve_key_hook:   .quad 0
+last_load_key_hook: .quad 0
+fromlib_hook:       .quad 0
+fromlib_clear_hook: .quad 0
+end_include_hook:   .quad 0
+chdir_hook:         .quad 0
+pwd_hook:           .quad 0
+dir_hook:           .quad 0
 inline_var:         .quad 0      // 0 = threaded :,  -1 = native/inline :
 compiling_native:   .quad 0
 inline_region:      .quad 0      // -1 = mid-colon [INLINE]...[THREAD] fragment
@@ -352,24 +403,40 @@ XSTATE:
     DPUSH x0
     NEXT
 
-BOOT_WORD "LATEST", "LATEST ( -- addr ) latest CFA variable", 0, XLATEST
+BOOT_WORD "LATEST", "LATEST ( -- addr ) FORTH wordlist head array", 0, XLATEST
 XLATEST:
     adrp x0, latest_var@page
     add  x0, x0, latest_var@pageoff
     DPUSH x0
     NEXT
 
+BOOT_WORD "LAST", "LAST ( -- xt ) CFA of most recently defined word", 0, XLAST
+XLAST:
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "CURRENT", "CURRENT ( -- addr ) compilation wordlist variable", 0, XCURRENT
+XCURRENT:
+    adrp x0, current_var@page
+    add  x0, x0, current_var@pageoff
+    DPUSH x0
+    NEXT
+
 BOOT_WORD "IMMEDIATE", "IMMEDIATE ( -- ) mark latest immediate", 0, XIMMEDIATE
 XIMMEDIATE:
-    adrp x0, latest_var@page
-    add  x0, x0, latest_var@pageoff
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
     ldr  x0, [x0]
+    cbz  x0, 1f
     ldr  x1, [x0, #-8]
     mov  x2, #1
     lsl  x2, x2, #63
     orr  x1, x1, x2
     str  x1, [x0, #-8]
-    NEXT
+1:  NEXT
 
 BOOT_WORD ":", ": ( \"name\" -- ) start colon definition", 0, XCOLON
 XCOLON:
@@ -403,11 +470,11 @@ XDCOLON:
 _colon_common:
     bl   _word
     cbz  x0, _colon_fail
-    bl   _counted_to_cstr
-    adrp x1, empty_help@page
-    add  x1, x1, empty_help@pageoff
+    bl   _counted_to_cstr            // x0 = name cstr
+    mov  x3, x20                     // preserve I: flag (0/1)
+    bl   _take_pending_help          // x1 = help cstr (preserves x0, x3)
     mov  x2, xzr
-    cbz  x20, 1f
+    cbz  x3, 1f
     mov  x2, #FL_INLINE              // I: → FFA inline bit (macro)
 1:  adrp x3, DOCOL@page
     add  x3, x3, DOCOL@pageoff
@@ -955,9 +1022,8 @@ BOOT_WORD "CREATE", "CREATE ( \"name\" -- ) header + DOVAR", 0, XCREATE
 XCREATE:
     bl   _word
     cbz  x0, _colon_fail
-    bl   _counted_to_cstr
-    adrp x1, empty_help@page
-    add  x1, x1, empty_help@pageoff
+    bl   _counted_to_cstr            // x0 = name cstr
+    bl   _take_pending_help          // x1 = help cstr
     mov  x2, #0
     adrp x3, DOVAR@page
     add  x3, x3, DOVAR@pageoff
@@ -977,16 +1043,17 @@ XDOES:
     bl   _compile_cell
     NEXT
 
-BOOT_WORD "(DOES>)", "(DOES>) ( -- ) patch latest with DODOES", 0, XDOES_RT
+BOOT_WORD "(DOES>)", "(DOES>) ( -- ) patch last defined with DODOES", 0, XDOES_RT
 XDOES_RT:
-    adrp x0, latest_var@page
-    add  x0, x0, latest_var@pageoff
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
     ldr  x0, [x0]
+    cbz  x0, 1f
     adrp x1, DODOES@page
     add  x1, x1, DODOES@pageoff
     str  x1, [x0]
     str  x19, [x0, #8]
-    RPOP
+1:  RPOP
     NEXT
 
 BOOT_WORD "POSTPONE", "POSTPONE ( \"name\" -- ) ANS postpone", FL_IMM, XPOSTPONE
@@ -1023,6 +1090,64 @@ XTICK:
     DPUSH x0
     NEXT
 
+// PARSE ( delim -- c-addr u ) text until delim in SOURCE; updates >IN (ANS: no lead skip)
+BOOT_WORD "PARSE", "PARSE ( char -- c-addr u ) parse until char in SOURCE", 0, XPARSE
+XPARSE:
+    DPOP x0                         // delimiter
+    and  w0, w0, #0xFF
+    adrp x1, source_addr@page
+    add  x1, x1, source_addr@pageoff
+    ldr  x1, [x1]
+    adrp x2, source_len@page
+    add  x2, x2, source_len@pageoff
+    ldr  x2, [x2]
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x4, [x3]                   // start offset
+    mov  x5, x4
+1:  cmp  x5, x2
+    b.hs 2f
+    ldrb w6, [x1, x5]
+    cmp  w6, w0
+    b.eq 3f
+    add  x5, x5, #1
+    b    1b
+3:  sub  x7, x5, x4                  // u
+    add  x5, x5, #1                 // skip delimiter
+    str  x5, [x3]
+    add  x1, x1, x4                 // c-addr
+    DPUSH x1
+    DPUSH x7
+    NEXT
+2:  sub  x7, x5, x4
+    str  x5, [x3]
+    add  x1, x1, x4
+    DPUSH x1
+    DPUSH x7
+    NEXT
+
+// SETDOC ( c-addr u -- ) pending help for next : / I: / CREATE (skip lead blanks)
+BOOT_WORD "SETDOC", "SETDOC ( c-addr u -- ) pending help for next defining word", 0, XSETDOC
+XSETDOC:
+    DPOP x1                         // u
+    DPOP x0                         // c-addr
+1:  cbz  x1, 2f
+    ldrb w2, [x0]
+    cmp  w2, #32
+    b.eq 3f
+    cmp  w2, #9
+    b.ne 2f
+3:  add  x0, x0, #1
+    sub  x1, x1, #1
+    b    1b
+2:  adrp x2, pending_help_addr@page
+    add  x2, x2, pending_help_addr@pageoff
+    str  x0, [x2]
+    adrp x2, pending_help_len@page
+    add  x2, x2, pending_help_len@pageoff
+    str  x1, [x2]
+    NEXT
+
 BOOT_WORD "\\", "\\ ( -- ) line comment", FL_IMM, XBS
 XBS:
     adrp x1, source_addr@page
@@ -1039,6 +1164,28 @@ XBS:
     ldrb w5, [x1, x4]
     add  x4, x4, #1
     cmp  w5, #10
+    b.ne 1b
+2:  str  x4, [x3]
+    NEXT
+
+// F-PC multi-line block comment: \\ … {  (word name is two backslashes)
+// Skip chars until '{' (consumed) or end of current SOURCE (no REFILL yet).
+BOOT_WORD "\\\\", "\\\\ ( -- ) multi-line comment until { (immediate)", FL_IMM, XDBS
+XDBS:
+    adrp x1, source_addr@page
+    add  x1, x1, source_addr@pageoff
+    ldr  x1, [x1]
+    adrp x2, source_len@page
+    add  x2, x2, source_len@pageoff
+    ldr  x2, [x2]
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x4, [x3]
+1:  cmp  x4, x2
+    b.hs 2f
+    ldrb w5, [x1, x4]
+    add  x4, x4, #1
+    cmp  w5, #'{'
     b.ne 1b
 2:  str  x4, [x3]
     NEXT
@@ -1728,12 +1875,804 @@ XDELETEFILE:
     DPUSH x0                    // ior
     NEXT
 
+// ============================================================================
+// INCLUDE / INCLUDED / REQUIRED / REQUIRE / .INCLUDED
+// Whole-file SOURCE nest (64Forth-style): push current SOURCE, install file
+// buffer, continue outer interpret; pop (+ free) when file SOURCE ends.
+// ============================================================================
+
+BOOT_WORD "INCLUDED", "INCLUDED ( c-addr u -- ) load and interpret named file", 0, XINCLUDED
+XINCLUDED:
+    DPOP x1                     // u
+    DPOP x0                     // c-addr
+    bl   _path_to_name_buf
+    b    _include_do
+
+BOOT_WORD "INCLUDE", "INCLUDE ( 'name'|bare|\"path\" -- ) load and interpret file", 0, XINCLUDE
+XINCLUDE:
+    bl   _next_filespec         // len 0 = bare → open panel via hook
+    b    _include_do
+
+BOOT_WORD "FLOAD", "FLOAD ( 'name'|bare -- ) synonym of INCLUDE", 0, XFLOAD
+XFLOAD:
+    b    XINCLUDE
+
+BOOT_WORD "REQUIRED", "REQUIRED ( c-addr u -- ) INCLUDED if not yet loaded", 0, XREQUIRED
+XREQUIRED:
+    DPOP x1
+    DPOP x0
+    bl   _path_to_name_buf
+    bl   _resolve_abs_key       // may rewrite name_buf to absolute key
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    bl   _included_find
+    cbnz x0, _require_skip
+    b    _include_do
+_require_skip:
+    bl   _fromlib_clear
+    NEXT
+
+BOOT_WORD "REQUIRE", "REQUIRE ( 'name' -- ) parse name REQUIRED", 0, XREQUIRE
+XREQUIRE:
+    bl   _next_filespec
+    cbz  x0, _include_need_name
+    bl   _resolve_abs_key
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    bl   _included_find
+    cbnz x0, _require_skip
+    b    _include_do
+
+BOOT_WORD ".INCLUDED", ".INCLUDED ( -- ) list files registered by INCLUDE/REQUIRED", 0, XDOTINCLUDED
+XDOTINCLUDED:
+    stp  x19, x20, [sp, #-16]!
+    adrp x1, str_included_hdr@page
+    add  x1, x1, str_included_hdr@pageoff
+    mov  x2, #10
+    bl   _sys_write
+    adrp x0, included_count@page
+    add  x0, x0, included_count@pageoff
+    ldr  x19, [x0]
+    cbz  x19, 9f
+    mov  x20, #0
+1:  cmp  x20, x19
+    b.hs 9f
+    mov  x0, #INCL_NAME
+    mul  x0, x0, x20
+    adrp x1, included_names@page
+    add  x1, x1, included_names@pageoff
+    add  x1, x1, x0
+    ldrb w2, [x1], #1
+    bl   _sys_write
+    adrp x1, str_nl@page
+    add  x1, x1, str_nl@pageoff
+    mov  x2, #1
+    bl   _sys_write
+    add  x20, x20, #1
+    b    1b
+9:  ldp  x19, x20, [sp], #16
+    NEXT
+
+BOOT_WORD "FROMLIB", "FROMLIB ( -- ) next INCLUDE/FLOAD/REQUIRE/CHDIR/DIR uses Library", 0, XFROMLIB
+XFROMLIB:
+    adrp x0, fromlib_hook@page
+    add  x0, x0, fromlib_hook@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    blr  x0
+    RESTORE_C_CALLEE
+1:  NEXT
+
+BOOT_WORD "FROM-LIBRARY", "FROM-LIBRARY ( -- ) synonym for FROMLIB", 0, XFROMLIB2
+XFROMLIB2:
+    b    XFROMLIB
+
+BOOT_WORD "FILE-ECHO", "FILE-ECHO ( -- addr ) variable; echo INCLUDE source when nonzero", 0, XFILEECHO
+XFILEECHO:
+    adrp x0, file_echo_var@page
+    add  x0, x0, file_echo_var@pageoff
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "\\S", "\\S ( -- ) stop rest of current SOURCE (immediate)", FL_IMM, XBACKSLASH_S
+XBACKSLASH_S:
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    ldr  x1, [x0]
+    adrp x0, to_in@page
+    add  x0, x0, to_in@pageoff
+    str  x1, [x0]
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    ldr  x0, [x0]
+    cbnz x0, 1f
+    adrp x0, repl_batch_stop@page
+    add  x0, x0, repl_batch_stop@pageoff
+    mov  x1, #1
+    str  x1, [x0]
+1:  NEXT
+
+BOOT_WORD "SOURCE", "SOURCE ( -- c-addr u ) current input buffer", 0, XSOURCE
+XSOURCE:
+    adrp x0, source_addr@page
+    add  x0, x0, source_addr@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "SOURCE-ID", "SOURCE-ID ( -- n ) 0=user, -1=EVALUATE, >0=INCLUDE", 0, XSOURCEID
+XSOURCEID:
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD ">IN", ">IN ( -- addr ) input offset variable", 0, XTOIN
+XTOIN:
+    adrp x0, to_in@page
+    add  x0, x0, to_in@pageoff
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "EVALUATE", "EVALUATE ( i*x c-addr u -- j*x ) interpret string", 0, XEVALUATE
+XEVALUATE:
+    DPOP x1                     // u
+    DPOP x0                     // c-addr
+    stp  x0, x1, [sp, #-16]!
+    bl   _push_source
+    ldp  x0, x1, [sp], #16
+    bl   _set_source
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    mov  x1, #SRCID_EVAL
+    str  x1, [x0]
+    adrp x0, file_echo_pos@page
+    add  x0, x0, file_echo_pos@pageoff
+    str  xzr, [x0]
+    // Continue outer interpret on the new SOURCE (do not return into caller colon).
+    b    _interpret_loop
+
+BOOT_WORD "REFILL", "REFILL ( -- flag ) refill input; false for INCLUDE/EVALUATE", 0, XREFILL
+XREFILL:
+    // Line-based GUI REPL: no multi-line refill yet.
+    mov  x0, #0
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "CHDIR", "CHDIR ( 'path'|bare -- ) change working directory", 0, XCHDIR
+XCHDIR:
+    bl   _next_filespec         // 0 = bare panel
+    adrp x0, chdir_hook@page
+    add  x0, x0, chdir_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  NEXT
+
+BOOT_WORD "PWD", "PWD ( -- ) print working directory", 0, XPWD
+XPWD:
+    adrp x0, pwd_hook@page
+    add  x0, x0, pwd_hook@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    blr  x0
+    RESTORE_C_CALLEE
+1:  NEXT
+
+BOOT_WORD "DIR", "DIR ( 'path'|bare -- ) list directory (* ? ok)", 0, XDIR
+XDIR:
+    bl   _next_filespec
+    adrp x0, dir_hook@page
+    add  x0, x0, dir_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  NEXT
+
+// ============================================================================
+// Search-Order / vocabularies (ANS + 64Forth lineage)
+// ============================================================================
+
+BOOT_WORD "DICT-THREADS", "DICT-THREADS ( -- n ) heads per wordlist", 0, XDICT_THREADS
+XDICT_THREADS:
+    mov  x0, #DICT_THREADS
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "FORTH-WORDLIST", "FORTH-WORDLIST ( -- wid ) main FORTH word list", 0, XFORTH_WORDLIST
+XFORTH_WORDLIST:
+    adrp x0, latest_var@page
+    add  x0, x0, latest_var@pageoff
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "GET-CURRENT", "GET-CURRENT ( -- wid ) compilation wordlist", 0, XGET_CURRENT
+XGET_CURRENT:
+    adrp x0, current_var@page
+    add  x0, x0, current_var@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "SET-CURRENT", "SET-CURRENT ( wid -- ) set compilation wordlist", 0, XSET_CURRENT
+XSET_CURRENT:
+    DPOP x0
+    adrp x1, current_var@page
+    add  x1, x1, current_var@pageoff
+    str  x0, [x1]
+    NEXT
+
+BOOT_WORD "WORDLIST", "WORDLIST ( -- wid ) create empty word list", 0, XWORDLIST
+XWORDLIST:
+    adrp x0, here_ptr@page
+    add  x0, x0, here_ptr@pageoff
+    ldr  x1, [x0]
+    add  x1, x1, #7
+    and  x1, x1, #-8
+    mov  x2, x1                    // wid
+    mov  x3, #DICT_THREADS
+1:  str  xzr, [x1], #8
+    subs x3, x3, #1
+    b.ne 1b
+    str  x1, [x0]
+    mov  x0, x2
+    bl   _wordlist_register
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "WORDLISTS", "WORDLISTS ( -- addr n ) registered wordlist table", 0, XWORDLISTS
+XWORDLISTS:
+    adrp x0, wordlist_reg@page
+    add  x0, x0, wordlist_reg@pageoff
+    DPUSH x0
+    adrp x0, wordlist_reg_n@page
+    add  x0, x0, wordlist_reg_n@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "GET-ORDER", "GET-ORDER ( -- widn ... wid1 n ) wid1 searched first", 0, XGET_ORDER
+XGET_ORDER:
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x1, [x0]
+    adrp x2, search_order@page
+    add  x2, x2, search_order@pageoff
+    mov  x3, x1
+1:  cbz  x3, 2f
+    sub  x3, x3, #1
+    ldr  x4, [x2, x3, lsl #3]
+    DPUSH x4
+    b    1b
+2:  DPUSH x1
+    NEXT
+
+BOOT_WORD "SET-ORDER", "SET-ORDER ( widn ... wid1 n -- ) n=-1 means ONLY", 0, XSET_ORDER
+XSET_ORDER:
+    DPOP x1                        // n
+    cmp  x1, #-1
+    b.eq XONLY
+    cmp  x1, #0
+    b.lt 9f
+    cmp  x1, #SEARCH_ORDER_MAX
+    b.hi 9f
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    str  x1, [x0]
+    adrp x2, search_order@page
+    add  x2, x2, search_order@pageoff
+    mov  x3, #0
+2:  cmp  x3, x1
+    b.hs 3f
+    DPOP x4
+    str  x4, [x2, x3, lsl #3]
+    add  x3, x3, #1
+    b    2b
+3:  NEXT
+9:  NEXT
+
+BOOT_WORD "PUSH-ORDER", "PUSH-ORDER ( wid -- ) prepend wid to search order", 0, XPUSH_ORDER
+XPUSH_ORDER:
+    DPOP x0                        // wid
+    adrp x1, search_order_n@page
+    add  x1, x1, search_order_n@pageoff
+    ldr  x2, [x1]
+    cmp  x2, #SEARCH_ORDER_MAX
+    b.hs 9f
+    adrp x3, search_order@page
+    add  x3, x3, search_order@pageoff
+    mov  x4, x2
+1:  cbz  x4, 2f
+    sub  x4, x4, #1
+    ldr  x5, [x3, x4, lsl #3]
+    add  x6, x4, #1
+    str  x5, [x3, x6, lsl #3]
+    b    1b
+2:  str  x0, [x3]
+    add  x2, x2, #1
+    str  x2, [x1]
+9:  NEXT
+
+BOOT_WORD "DEFINITIONS", "DEFINITIONS ( -- ) CURRENT = first in search order", 0, XDEFINITIONS
+XDEFINITIONS:
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    adrp x1, search_order@page
+    add  x1, x1, search_order@pageoff
+    ldr  x1, [x1]
+    adrp x0, current_var@page
+    add  x0, x0, current_var@pageoff
+    str  x1, [x0]
+1:  NEXT
+
+BOOT_WORD "ONLY", "ONLY ( -- ) search order = FORTH only", 0, XONLY
+XONLY:
+    adrp x0, latest_var@page
+    add  x0, x0, latest_var@pageoff
+    adrp x1, search_order@page
+    add  x1, x1, search_order@pageoff
+    str  x0, [x1]
+    mov  x0, #1
+    adrp x1, search_order_n@page
+    add  x1, x1, search_order_n@pageoff
+    str  x0, [x1]
+    NEXT
+
+BOOT_WORD "ALSO", "ALSO ( -- ) duplicate first search-order entry", 0, XALSO
+XALSO:
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 9f
+    cmp  x1, #SEARCH_ORDER_MAX
+    b.hs 9f
+    adrp x2, search_order@page
+    add  x2, x2, search_order@pageoff
+    ldr  x3, [x2]
+    mov  x4, x1
+1:  cbz  x4, 2f
+    sub  x4, x4, #1
+    ldr  x5, [x2, x4, lsl #3]
+    add  x6, x4, #1
+    str  x5, [x2, x6, lsl #3]
+    b    1b
+2:  str  x3, [x2]
+    add  x1, x1, #1
+    str  x1, [x0]
+9:  NEXT
+
+BOOT_WORD "PREVIOUS", "PREVIOUS ( -- ) drop first search-order entry", 0, XPREVIOUS
+XPREVIOUS:
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x1, [x0]
+    cmp  x1, #1
+    b.ls 9f
+    adrp x2, search_order@page
+    add  x2, x2, search_order@pageoff
+    mov  x3, #0
+1:  add  x4, x3, #1
+    cmp  x4, x1
+    b.hs 2f
+    ldr  x5, [x2, x4, lsl #3]
+    str  x5, [x2, x3, lsl #3]
+    add  x3, x3, #1
+    b    1b
+2:  sub  x1, x1, #1
+    str  x1, [x0]
+9:  NEXT
+
+BOOT_WORD "FORTH", "FORTH ( -- ) set first search-order entry to FORTH", 0, XFORTH
+XFORTH:
+    adrp x0, latest_var@page
+    add  x0, x0, latest_var@pageoff
+    adrp x1, search_order@page
+    add  x1, x1, search_order@pageoff
+    str  x0, [x1]
+    adrp x1, search_order_n@page
+    add  x1, x1, search_order_n@pageoff
+    ldr  x2, [x1]
+    cbnz x2, 1f
+    mov  x2, #1
+    str  x2, [x1]
+1:  NEXT
+
+BOOT_WORD "FIND", "FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) counted name", 0, XFIND
+XFIND:
+    DPOP x2                        // c-addr (counted)
+    mov  x0, x2
+    stp  x2, xzr, [sp, #-16]!
+    bl   _find
+    ldp  x2, xzr, [sp], #16
+    cbz  x0, 1f
+    DPUSH x0
+    DPUSH x1
+    NEXT
+1:  DPUSH x2
+    mov  x0, #0
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "SEARCH-WORDLIST", "SEARCH-WORDLIST ( c-addr u wid -- 0 | xt 1 | xt -1 )", 0, XSEARCH_WORDLIST
+XSEARCH_WORDLIST:
+    DPOP x9                        // wid
+    DPOP x8                        // u
+    DPOP x7                        // c-addr
+    cbz  x9, _swl_miss
+    cbz  x8, _swl_miss
+    ldr  x21, [x9]                 // tip (DICT_THREADS=1)
+_swl_loop:
+    cbz  x21, _swl_miss
+    ldr  x2, [x21, #-8]
+    and  x3, x2, #0xFFFF
+    sub  x4, x21, x3
+    ldrb w3, [x4], #1
+    cmp  x3, x8
+    b.ne _swl_next
+    mov  x5, #0
+_swl_cmp:
+    cmp  x5, x8
+    b.hs _swl_hit
+    ldrb w6, [x4, x5]
+    ldrb w10, [x7, x5]
+    cmp  w10, #'a'
+    b.lo 1f
+    cmp  w10, #'z'
+    b.hi 1f
+    sub  w10, w10, #32
+1:  cmp  w6, w10
+    b.ne _swl_next
+    add  x5, x5, #1
+    b    _swl_cmp
+_swl_hit:
+    tst  x2, #(1 << 63)
+    mov  x0, #-1
+    b.eq 2f
+    mov  x0, #1
+2:  DPUSH x21
+    DPUSH x0
+    NEXT
+_swl_next:
+    ldr  x21, [x21, #-16]
+    b    _swl_loop
+_swl_miss:
+    mov  x0, #0
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "ORDER", "ORDER ( -- ) print search order and CURRENT", 0, XORDER
+XORDER:
+    // Preserve IP / scratch (x19–x21 are VM + temps)
+    stp  x19, x20, [sp, #-32]!
+    str  x21, [sp, #16]
+    adrp x1, str_search_order@page
+    add  x1, x1, str_search_order@pageoff
+    mov  x2, #14
+    bl   _sys_write
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x19, [x0]
+    adrp x20, search_order@page
+    add  x20, x20, search_order@pageoff
+    mov  x21, #0
+1:  cmp  x21, x19
+    b.hs 2f
+    ldr  x0, [x20, x21, lsl #3]
+    bl   _print_wid_name
+    mov  x0, #' '
+    bl   _putchar
+    add  x21, x21, #1
+    b    1b
+2:  adrp x1, str_nl@page
+    add  x1, x1, str_nl@pageoff
+    mov  x2, #1
+    bl   _sys_write
+    adrp x1, str_comp_wl@page
+    add  x1, x1, str_comp_wl@pageoff
+    mov  x2, #22
+    bl   _sys_write
+    adrp x0, current_var@page
+    add  x0, x0, current_var@pageoff
+    ldr  x0, [x0]
+    bl   _print_wid_name
+    adrp x1, str_nl@page
+    add  x1, x1, str_nl@pageoff
+    mov  x2, #1
+    bl   _sys_write
+    ldr  x21, [sp, #16]
+    ldp  x19, x20, [sp], #32
+    NEXT
+
+// TRAVERSE-WORDLIST ( i*x xt wid -- j*x )
+// Visitor: ( i*x nt -- j*x flag ); stop on false. nt = CFA.
+// R (top first while visiting): next, xt, thread, wid, saved_IP
+BOOT_WORD "TRAVERSE-WORDLIST", "TRAVERSE-WORDLIST ( i*x xt wid -- j*x ) visit each name in wid", 0, XTRAVERSE_WORDLIST
+XTRAVERSE_WORDLIST:
+    DPOP x5                        // wid
+    DPOP x6                        // visitor xt
+    RPUSH                          // R: saved IP
+    str  x5, [x23, #-8]!           // R: wid
+    mov  x7, #0
+    str  x7, [x23, #-8]!           // R: thread
+    str  x6, [x23, #-8]!           // R: xt
+    ldr  x7, [x5]                  // heads[0]
+_tw_loop:
+    cbz  x7, _tw_advance_thread
+    ldr  x8, [x7, #-16]            // next CFA
+    ldr  x6, [x23]                 // xt peek
+    str  x8, [x23, #-8]!           // R: next
+    DPUSH x7                       // nt
+    mov  x21, x6
+    ldr  x1, [x21]
+    adrp x19, tw_continue_cell@page
+    add  x19, x19, tw_continue_cell@pageoff
+    br   x1
+
+BOOT_WORD "(TW-CONT)", "(TW-CONT) TRAVERSE-WORDLIST continuation", 0, XTW_CONTINUE
+.align 4
+XTW_CONTINUE:
+    DPOP x0                        // flag
+    ldr  x8, [x23], #8             // next
+    ldr  x6, [x23]                 // xt peek
+    cbz  x0, _tw_stop
+    mov  x7, x8
+    cbz  x7, _tw_advance_thread
+    b    _tw_loop
+_tw_stop:
+    ldr  x6, [x23], #8             // xt
+    ldr  x7, [x23], #8             // thread
+    ldr  x5, [x23], #8             // wid
+    RPOP
+    NEXT
+_tw_advance_thread:
+    // R top: xt, thread, wid, IP
+    ldr  x6, [x23], #8             // xt
+    ldr  x7, [x23], #8             // thread
+    ldr  x5, [x23], #8             // wid
+    add  x7, x7, #1
+    cmp  x7, #DICT_THREADS
+    b.hs _tw_done
+    str  x5, [x23, #-8]!
+    str  x7, [x23, #-8]!
+    str  x6, [x23, #-8]!
+    add  x0, x5, x7, lsl #3
+    ldr  x7, [x0]
+    b    _tw_loop
+_tw_done:
+    RPOP
+    NEXT
+
 BOOT_WORD "PICK", "PICK ( xu ... x0 u -- xu ... x0 xu )", 0, XPICK
 XPICK:
     DPOP x0                     // u
     lsl  x0, x0, #3             // byte offset
     ldr  x0, [x22, x0]          // load xu
     DPUSH x0
+    NEXT
+
+BOOT_WORD "LSHIFT", "LSHIFT ( n u -- n' ) logical left shift", FL_INLINE, XLSHIFT
+XLSHIFT:
+    DPOP x1                     // u
+    DPOP x0                     // n
+    lsl  x0, x0, x1
+    DPUSH x0
+XLSHIFT_END:
+    NEXT
+
+BOOT_WORD "RSHIFT", "RSHIFT ( n u -- n' ) logical right shift", FL_INLINE, XRSHIFT
+XRSHIFT:
+    DPOP x1                     // u
+    DPOP x0                     // n
+    lsr  x0, x0, x1
+    DPUSH x0
+XRSHIFT_END:
+    NEXT
+
+// SEE helpers: push cached xts / DOCOL code address (avoid awkward names in .fth)
+BOOT_WORD "LIT-ADDR", "LIT-ADDR ( -- xt ) xt of LIT (for SEE)", 0, XLIT_ADDR
+XLIT_ADDR:
+    adrp x0, cfa_lit@page
+    add  x0, x0, cfa_lit@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "0BRANCH-ADDR", "0BRANCH-ADDR ( -- xt ) xt of 0BRANCH (for SEE)", 0, X0BRANCH_ADDR
+X0BRANCH_ADDR:
+    adrp x0, cfa_0branch@page
+    add  x0, x0, cfa_0branch@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "BRANCH-ADDR", "BRANCH-ADDR ( -- xt ) xt of BRANCH (for SEE)", 0, XBRANCH_ADDR
+XBRANCH_ADDR:
+    adrp x0, cfa_branch@page
+    add  x0, x0, cfa_branch@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "EXIT-ADDR", "EXIT-ADDR ( -- xt ) xt of EXIT (for SEE)", 0, XEXIT_ADDR
+XEXIT_ADDR:
+    adrp x0, cfa_exit@page
+    add  x0, x0, cfa_exit@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "SLIT-ADDR", "SLIT-ADDR ( -- xt ) xt of (S\") runtime (for SEE)", 0, XSLIT_ADDR
+XSLIT_ADDR:
+    adrp x0, cfa_slit@page
+    add  x0, x0, cfa_slit@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "DO-ADDR", "DO-ADDR ( -- xt ) xt of (DO) runtime (for SEE)", 0, XDO_ADDR
+XDO_ADDR:
+    adrp x0, cfa_do@page
+    add  x0, x0, cfa_do@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "QDO-ADDR", "QDO-ADDR ( -- xt ) xt of (?DO) runtime (for SEE)", 0, XQDO_ADDR
+XQDO_ADDR:
+    adrp x0, cfa_qdo@page
+    add  x0, x0, cfa_qdo@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "LOOP-ADDR", "LOOP-ADDR ( -- xt ) xt of (LOOP) runtime (for SEE)", 0, XLOOP_ADDR
+XLOOP_ADDR:
+    adrp x0, cfa_loop@page
+    add  x0, x0, cfa_loop@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "PLUSLOOP-ADDR", "PLUSLOOP-ADDR ( -- xt ) xt of (+LOOP) runtime (for SEE)", 0, XPLUSLOOP_ADDR
+XPLUSLOOP_ADDR:
+    adrp x0, cfa_plusloop@page
+    add  x0, x0, cfa_plusloop@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "DOCOL-ADDR", "DOCOL-ADDR ( -- addr ) address of DOCOL (colon entry; for DOCOL?/SEE)", 0, XDOCOL_ADDR
+XDOCOL_ADDR:
+    adrp x0, DOCOL@page
+    add  x0, x0, DOCOL@pageoff
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "BASE", "BASE ( -- addr ) current numeric base variable", 0, XBASE
+XBASE:
+    adrp x0, base_var@page
+    add  x0, x0, base_var@pageoff
+    DPUSH x0
+    NEXT
+
+// UM/MOD ( ulo uhi u -- rem quot )
+BOOT_WORD "UM/MOD", "UM/MOD ( ud u -- rem quot ) unsigned double divmod", 0, XUMMOD
+XUMMOD:
+    DPOP x2                         // divisor
+    DPOP x1                         // uhi
+    DPOP x0                         // ulo
+    cbz  x2, 2f
+    cbnz x1, 1f
+    udiv x3, x0, x2
+    msub x4, x3, x2, x0
+    DPUSH x4
+    DPUSH x3
+    NEXT
+1:  SAVE_C_CALLEE
+    sub  sp, sp, #16
+    mov  x3, sp                     // &rem
+    add  x4, sp, #8                 // &quot
+    bl   _forth_udivmod128
+    ldr  x4, [sp]                   // rem
+    ldr  x3, [sp, #8]               // quot
+    add  sp, sp, #16
+    RESTORE_C_CALLEE
+    DPUSH x4
+    DPUSH x3
+    NEXT
+2:  DPUSH xzr
+    DPUSH xzr
+    NEXT
+
+// MS@ ( -- u ) wall-clock ms since Unix epoch (gettimeofday)
+BOOT_WORD "MS@", "MS@ ( -- u ) wall-clock milliseconds since epoch", 0, XMSFETCH
+XMSFETCH:
+    SAVE_C_CALLEE
+    adrp x0, timeval_buf@page
+    add  x0, x0, timeval_buf@pageoff
+    mov  x1, xzr
+    bl   _gettimeofday
+    adrp x2, timeval_buf@page
+    add  x2, x2, timeval_buf@pageoff
+    ldr  x0, [x2]                   // tv_sec
+    ldr  x1, [x2, #8]               // tv_usec
+    mov  x2, #1000
+    mul  x0, x0, x2
+    udiv x1, x1, x2
+    add  x0, x0, x1
+    RESTORE_C_CALLEE
+    DPUSH x0
+    NEXT
+
+// MS ( u -- ) sleep at least u ms via nanosleep (yields; GUI-safe)
+BOOT_WORD "MS", "MS ( u -- ) wait at least u milliseconds (OS sleep; yields)", 0, XMS
+XMS:
+    DPOP x0
+    cbz  x0, _ms_done
+    adrp x1, ms_remain@page
+    add  x1, x1, ms_remain@pageoff
+    str  x0, [x1]
+    SAVE_C_CALLEE
+_ms_chunk:
+    adrp x1, ms_remain@page
+    add  x1, x1, ms_remain@pageoff
+    ldr  x19, [x1]
+    cbz  x19, _ms_restore
+    mov  x1, #1000
+    cmp  x19, x1
+    csel x2, x19, x1, lo            // chunk ms
+    udiv x3, x2, x1                 // sec 0 or 1
+    msub x4, x3, x1, x2             // rem_ms
+    mov  x5, #1000
+    mul  x4, x4, x5
+    mul  x4, x4, x5                 // nsec
+    adrp x0, timespec_buf@page
+    add  x0, x0, timespec_buf@pageoff
+    str  x3, [x0]
+    str  x4, [x0, #8]
+    mov  x1, xzr                    // rem = NULL (ignore EINTR remainder)
+    bl   _nanosleep
+    adrp x1, ms_remain@page
+    add  x1, x1, ms_remain@pageoff
+    ldr  x19, [x1]
+    mov  x2, #1000
+    cmp  x19, x2
+    csel x3, x19, x2, lo
+    sub  x19, x19, x3
+    str  x19, [x1]
+    cbnz x19, _ms_chunk
+_ms_restore:
+    RESTORE_C_CALLEE
+_ms_done:
     NEXT
 
 .section __DATA,__bootword,regular
@@ -1770,6 +2709,8 @@ inline_len_tab:
     .quad XK,     XK_END
     .quad XUNLOOP,XUNLOOP_END
     .quad XLEAVE, XLEAVE_END
+    .quad XLSHIFT,XLSHIFT_END
+    .quad XRSHIFT,XRSHIFT_END
     .quad 0, 0
 
 // ============================================================================
@@ -1816,6 +2757,77 @@ _kernel_set_emit_buf:
     adrp x1, emit_buf_hook@page
     add  x1, x1, emit_buf_hook@pageoff
     str  x0, [x1]
+    ret
+
+.globl _kernel_set_fromlib
+_kernel_set_fromlib:
+    adrp x1, fromlib_hook@page
+    add  x1, x1, fromlib_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_fromlib_clear
+_kernel_set_fromlib_clear:
+    adrp x1, fromlib_clear_hook@page
+    add  x1, x1, fromlib_clear_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_end_include
+_kernel_set_end_include:
+    adrp x1, end_include_hook@page
+    add  x1, x1, end_include_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_load_file
+_kernel_set_load_file:
+    adrp x1, load_file_hook@page
+    add  x1, x1, load_file_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_resolve_key
+_kernel_set_resolve_key:
+    adrp x1, resolve_key_hook@page
+    add  x1, x1, resolve_key_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_last_load_key
+_kernel_set_last_load_key:
+    adrp x1, last_load_key_hook@page
+    add  x1, x1, last_load_key_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_chdir
+_kernel_set_chdir:
+    adrp x1, chdir_hook@page
+    add  x1, x1, chdir_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_pwd
+_kernel_set_pwd:
+    adrp x1, pwd_hook@page
+    add  x1, x1, pwd_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_dir
+_kernel_set_dir:
+    adrp x1, dir_hook@page
+    add  x1, x1, dir_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_take_repl_batch_stop
+_kernel_take_repl_batch_stop:
+    adrp x1, repl_batch_stop@page
+    add  x1, x1, repl_batch_stop@pageoff
+    ldr  x0, [x1]
+    str  xzr, [x1]
     ret
 
 // _putchar: w0 = character. Prefer emit_hook; else write(1).
@@ -1936,6 +2948,39 @@ _counted_to_cstr:
     mov  x0, x2
     ret
 
+// _take_pending_help: x1 = help C-string for _header_build; clears pending.
+// Preserves x0 and x3. Copies SETDOC text into pending_help_buf (NUL-terminated).
+_take_pending_help:
+    stp  x0, x3, [sp, #-16]!
+    adrp x4, pending_help_addr@page
+    add  x4, x4, pending_help_addr@pageoff
+    ldr  x0, [x4]
+    adrp x5, pending_help_len@page
+    add  x5, x5, pending_help_len@pageoff
+    ldr  x2, [x5]
+    str  xzr, [x4]
+    str  xzr, [x5]
+    cbz  x0, 2f
+    cbz  x2, 2f
+    cmp  x2, #255
+    b.ls 0f
+    mov  x2, #255
+0:  adrp x1, pending_help_buf@page
+    add  x1, x1, pending_help_buf@pageoff
+    mov  x4, x1
+1:  cbz  x2, 3f
+    ldrb w5, [x0], #1
+    strb w5, [x4], #1
+    sub  x2, x2, #1
+    b    1b
+3:  strb wzr, [x4]
+    ldp  x0, x3, [sp], #16
+    ret
+2:  adrp x1, empty_help@page
+    add  x1, x1, empty_help@pageoff
+    ldp  x0, x3, [sp], #16
+    ret
+
 _header_build:
     stp  x29, x30, [sp, #-48]!
     mov  x29, sp
@@ -1988,9 +3033,14 @@ _header_build:
     add  x5, x5, #24
     add  x10, x9, #16
 
+    // Link into CURRENT wordlist head (fallback FORTH).
+    adrp x11, current_var@page
+    add  x11, x11, current_var@pageoff
+    ldr  x11, [x11]
+    cbnz x11, 4f
     adrp x11, latest_var@page
     add  x11, x11, latest_var@pageoff
-    ldr  x12, [x11]
+4:  ldr  x12, [x11]
     str  x12, [x9]
 
     sub  x13, x10, x7
@@ -2011,7 +3061,7 @@ _in: tst  x21, #FL_INLINE       // Testing for inlinable
     adrp x4, here_ptr@page
     add  x4, x4, here_ptr@pageoff
     str  x5, [x4]
-    str  x10, [x11]
+    str  x10, [x11]             // CURRENT tip = new CFA
 
     adrp x4, last_cfa@page
     add  x4, x4, last_cfa@pageoff
@@ -2032,7 +3082,507 @@ _set_source:
     adrp x2, to_in@page
     add  x2, x2, to_in@pageoff
     str  xzr, [x2]
+    adrp x2, file_echo_pos@page
+    add  x2, x2, file_echo_pos@pageoff
+    str  xzr, [x2]
     ret
+
+// Echo INCLUDE source through current >IN when FILE-ECHO nonzero.
+_file_echo_upto:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    adrp x0, file_echo_var@page
+    add  x0, x0, file_echo_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    ldr  x0, [x0]
+    cmp  x0, #0
+    b.le 9f
+    adrp x19, source_addr@page
+    add  x19, x19, source_addr@pageoff
+    ldr  x19, [x19]
+    adrp x0, file_echo_pos@page
+    add  x0, x0, file_echo_pos@pageoff
+    ldr  x20, [x0]               // start
+    adrp x1, to_in@page
+    add  x1, x1, to_in@pageoff
+    ldr  x1, [x1]                // end = >IN
+    cmp  x20, x1
+    b.hs 9f
+1:  cmp  x20, x1
+    b.hs 2f
+    ldrb w0, [x19, x20]
+    bl   _putchar
+    add  x20, x20, #1
+    b    1b
+2:  adrp x0, file_echo_pos@page
+    add  x0, x0, file_echo_pos@pageoff
+    str  x20, [x0]
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// _push_source: save addr,len,>IN,id,echo_pos. x0=1 ok, 0=overflow.
+_push_source:
+    adrp x0, source_sp@page
+    add  x0, x0, source_sp@pageoff
+    ldr  x1, [x0]
+    cmp  x1, #SRC_MAX
+    b.hs 1f
+    mov  x2, #SRC_FRAME
+    mul  x3, x1, x2
+    adrp x2, source_stack@page
+    add  x2, x2, source_stack@pageoff
+    add  x2, x2, x3
+    adrp x3, source_addr@page
+    add  x3, x3, source_addr@pageoff
+    ldr  x3, [x3]
+    str  x3, [x2], #8
+    adrp x3, source_len@page
+    add  x3, x3, source_len@pageoff
+    ldr  x3, [x3]
+    str  x3, [x2], #8
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x3, [x3]
+    str  x3, [x2], #8
+    adrp x3, source_id_var@page
+    add  x3, x3, source_id_var@pageoff
+    ldr  x3, [x3]
+    str  x3, [x2], #8
+    adrp x3, file_echo_pos@page
+    add  x3, x3, file_echo_pos@pageoff
+    ldr  x3, [x3]
+    str  x3, [x2]
+    add  x1, x1, #1
+    str  x1, [x0]
+    mov  x0, #1
+    ret
+1:  mov  x0, #0
+    ret
+
+// _call_end_include: if current SOURCE-ID > 0, invoke end_include hook.
+_call_end_include:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    ldr  x0, [x0]
+    cmp  x0, #0
+    b.le 1f
+    adrp x0, end_include_hook@page
+    add  x0, x0, end_include_hook@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    blr  x0
+    RESTORE_C_CALLEE
+1:  ldp  x29, x30, [sp], #16
+    ret
+
+_fromlib_clear:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, fromlib_clear_hook@page
+    add  x0, x0, fromlib_clear_hook@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    blr  x0
+    RESTORE_C_CALLEE
+1:  ldp  x29, x30, [sp], #16
+    ret
+
+// _pop_source: end_include + free malloc buffer if SRCID_MALLOC; restore frame.
+// x0=1 restored, 0=already at base.
+_pop_source:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, source_sp@page
+    add  x0, x0, source_sp@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 9f
+    bl   _call_end_include
+    adrp x2, source_id_var@page
+    add  x2, x2, source_id_var@pageoff
+    ldr  x3, [x2]
+    cmp  x3, #SRCID_MALLOC
+    b.ne 1f
+    adrp x3, source_addr@page
+    add  x3, x3, source_addr@pageoff
+    ldr  x0, [x3]
+    cbz  x0, 1f
+    bl   _free
+1:  adrp x0, source_sp@page
+    add  x0, x0, source_sp@pageoff
+    ldr  x1, [x0]
+    sub  x1, x1, #1
+    str  x1, [x0]
+    mov  x2, #SRC_FRAME
+    mul  x3, x1, x2
+    adrp x2, source_stack@page
+    add  x2, x2, source_stack@pageoff
+    add  x2, x2, x3
+    ldr  x3, [x2], #8
+    adrp x0, source_addr@page
+    add  x0, x0, source_addr@pageoff
+    str  x3, [x0]
+    ldr  x3, [x2], #8
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    str  x3, [x0]
+    ldr  x3, [x2], #8
+    adrp x0, to_in@page
+    add  x0, x0, to_in@pageoff
+    str  x3, [x0]
+    ldr  x3, [x2], #8
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    str  x3, [x0]
+    ldr  x3, [x2]
+    adrp x0, file_echo_pos@page
+    add  x0, x0, file_echo_pos@pageoff
+    str  x3, [x0]
+    mov  x0, #1
+    ldp  x29, x30, [sp], #16
+    ret
+9:  mov  x0, #0
+    ldp  x29, x30, [sp], #16
+    ret
+
+// _path_to_name_buf: x0=c-addr, x1=u → name_buf NUL, include_path_len=u (capped).
+_path_to_name_buf:
+    cmp  x1, #255
+    b.ls 1f
+    mov  x1, #255
+1:  adrp x2, include_path_len@page
+    add  x2, x2, include_path_len@pageoff
+    str  x1, [x2]
+    adrp x2, name_buf@page
+    add  x2, x2, name_buf@pageoff
+    mov  x3, x1
+2:  cbz  x3, 3f
+    ldrb w4, [x0], #1
+    strb w4, [x2], #1
+    sub  x3, x3, #1
+    b    2b
+3:  strb wzr, [x2]
+    ret
+
+// _next_filespec: parse next path from SOURCE (preserves case; supports "quotes").
+// → name_buf, include_path_len; x0=len (0 if none).
+_next_filespec:
+    adrp x1, source_addr@page
+    add  x1, x1, source_addr@pageoff
+    ldr  x1, [x1]
+    adrp x2, source_len@page
+    add  x2, x2, source_len@pageoff
+    ldr  x2, [x2]
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x4, [x3]
+1:  cmp  x4, x2
+    b.hs 8f
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.hi 2f
+    add  x4, x4, #1
+    b    1b
+2:  cmp  w5, #'"'
+    b.eq 4f
+    // unquoted: until whitespace
+    mov  x6, x4
+3:  cmp  x4, x2
+    b.hs 5f
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.ls 5f
+    add  x4, x4, #1
+    b    3b
+5:  sub  x7, x4, x6
+    str  x4, [x3]
+    add  x0, x1, x6
+    mov  x1, x7
+    b    _path_to_name_buf_ret
+4:  // quoted
+    add  x4, x4, #1
+    mov  x6, x4
+6:  cmp  x4, x2
+    b.hs 7f
+    ldrb w5, [x1, x4]
+    cmp  w5, #'"'
+    b.eq 7f
+    add  x4, x4, #1
+    b    6b
+7:  sub  x7, x4, x6
+    cmp  x4, x2
+    b.hs 70f
+    add  x4, x4, #1             // consume closing quote
+70: str  x4, [x3]
+    add  x0, x1, x6
+    mov  x1, x7
+    b    _path_to_name_buf_ret
+8:  str  x4, [x3]
+    mov  x0, #0
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    str  xzr, [x1]
+    ret
+_path_to_name_buf_ret:
+    stp  x30, xzr, [sp, #-16]!
+    bl   _path_to_name_buf
+    adrp x0, include_path_len@page
+    add  x0, x0, include_path_len@pageoff
+    ldr  x0, [x0]
+    ldp  x30, xzr, [sp], #16
+    ret
+
+// _included_find: x0=path bytes, x1=len → x0=1 if in registry (case-sensitive).
+_included_find:
+    adrp x2, included_count@page
+    add  x2, x2, included_count@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 9f
+    mov  x3, #0
+1:  cmp  x3, x2
+    b.hs 9f
+    mov  x4, #INCL_NAME
+    mul  x4, x4, x3
+    adrp x5, included_names@page
+    add  x5, x5, included_names@pageoff
+    add  x5, x5, x4
+    ldrb w6, [x5]
+    cmp  x6, x1
+    b.ne 2f
+    add  x7, x5, #1
+    mov  x8, x0
+    mov  x9, x1
+3:  cbz  x9, 4f
+    ldrb w10, [x7], #1
+    ldrb w11, [x8], #1
+    cmp  w10, w11
+    b.ne 2f
+    sub  x9, x9, #1
+    b    3b
+4:  mov  x0, #1
+    ret
+2:  add  x3, x3, #1
+    b    1b
+9:  mov  x0, #0
+    ret
+
+// _included_register: name_buf / include_path_len → registry (no-op if full/dup).
+_included_register:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 9f
+    bl   _included_find
+    cbnz x0, 9f
+    adrp x0, included_count@page
+    add  x0, x0, included_count@pageoff
+    ldr  x2, [x0]
+    cmp  x2, #INCL_MAX
+    b.hs 9f
+    mov  x3, #INCL_NAME
+    mul  x3, x3, x2
+    adrp x4, included_names@page
+    add  x4, x4, included_names@pageoff
+    add  x4, x4, x3
+    cmp  x1, #255
+    b.ls 1f
+    mov  x1, #255
+1:  strb w1, [x4], #1
+    adrp x5, name_buf@page
+    add  x5, x5, name_buf@pageoff
+2:  cbz  x1, 3f
+    ldrb w6, [x5], #1
+    strb w6, [x4], #1
+    sub  x1, x1, #1
+    b    2b
+3:  add  x2, x2, #1
+    str  x2, [x0]
+9:  ldp  x29, x30, [sp], #16
+    ret
+
+_include_need_name:
+    adrp x1, str_incl_need@page
+    add  x1, x1, str_incl_need@pageoff
+    mov  x2, #18
+    bl   _sys_write
+    bl   _fromlib_clear
+    b    _abort
+
+// _resolve_abs_key: if resolve_key_hook set, rewrite name_buf to absolute key.
+// Hook: (path, path_len, out, out_max, out_len*) — 5th arg on stack.
+_resolve_abs_key:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, resolve_key_hook@page
+    add  x0, x0, resolve_key_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 9f
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 9f
+    adrp x2, resolve_key_buf@page
+    add  x2, x2, resolve_key_buf@pageoff
+    mov  x3, #255
+    sub  sp, sp, #32
+    str  xzr, [sp, #16]          // out_len cell
+    add  x4, sp, #16
+    str  x4, [sp]                // 5th arg: &out_len
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+    ldr  x1, [sp, #16]
+    add  sp, sp, #32
+    cbnz x0, 9f
+    cbz  x1, 9f
+    adrp x0, resolve_key_buf@page
+    add  x0, x0, resolve_key_buf@pageoff
+    bl   _path_to_name_buf
+9:  ldp  x29, x30, [sp], #16
+    ret
+
+// Prefer last_load_key absolute path into name_buf before registry insert.
+// Hook: (out, out_max, out_len*)
+_apply_last_load_key:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, last_load_key_hook@page
+    add  x0, x0, last_load_key_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 9f
+    adrp x0, resolve_key_buf@page
+    add  x0, x0, resolve_key_buf@pageoff
+    mov  x1, #255
+    sub  sp, sp, #16
+    str  xzr, [sp]
+    mov  x2, sp                  // &out_len
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+    ldr  x1, [sp], #16
+    cbnz x0, 9f
+    cbz  x1, 9f
+    adrp x0, resolve_key_buf@page
+    add  x0, x0, resolve_key_buf@pageoff
+    bl   _path_to_name_buf
+9:  ldp  x29, x30, [sp], #16
+    ret
+
+// Shared: name_buf + include_path_len (0 = bare). Hook or host_load_entire fallback.
+_include_do:
+    stp  x19, x20, [sp, #-48]!
+    str  xzr, [sp, #16]          // out_buf
+    str  xzr, [sp, #24]          // out_len
+    str  xzr, [sp, #32]          // owned: 0=host, 1=malloc
+    adrp x1, include_path_len@page
+    add  x1, x1, include_path_len@pageoff
+    ldr  x1, [x1]
+    // Try host load_file hook first (supports bare panel).
+    adrp x0, load_file_hook@page
+    add  x0, x0, load_file_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, _include_fallback
+    cbz  x1, 2f
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    b    3f
+2:  mov  x0, #0
+    mov  x1, #0
+3:  add  x2, sp, #16
+    add  x3, sp, #24
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+    mov  x19, x0
+    ldr  x20, [sp, #16]
+    cbnz x19, _include_fail_msg
+    cbz  x20, _include_fail_msg
+    // host-owned buffer
+    str  xzr, [sp, #32]
+    b    _include_install
+
+_include_fallback:
+    // Headless: no bare panel
+    cbz  x1, _include_need_name_pop
+    adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    add  x2, sp, #16
+    add  x3, sp, #24
+    // host_load_entire wants long long* out_buf/out_len — same layout
+    SAVE_C_CALLEE
+    bl   _host_load_entire
+    RESTORE_C_CALLEE
+    mov  x19, x0
+    ldr  x20, [sp, #16]
+    cbnz x19, _include_fail_msg
+    cbz  x20, _include_fail_msg
+    mov  x0, #1
+    str  x0, [sp, #32]           // malloc-owned
+    b    _include_install
+
+_include_need_name_pop:
+    ldp  x19, x20, [sp], #48
+    b    _include_need_name
+
+_include_install:
+    bl   _push_source
+    cbz  x0, _include_overflow_free
+    mov  x0, x20
+    ldr  x1, [sp, #24]
+    bl   _set_source
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    ldr  x1, [sp, #32]
+    cbnz x1, 1f
+    mov  x1, #SRCID_HOST
+    b    2f
+1:  mov  x1, #SRCID_MALLOC
+2:  str  x1, [x0]
+    adrp x0, file_echo_pos@page
+    add  x0, x0, file_echo_pos@pageoff
+    str  xzr, [x0]
+    bl   _apply_last_load_key
+    bl   _included_register
+    ldp  x19, x20, [sp], #48
+    NEXT
+
+_include_overflow_free:
+    ldr  x0, [sp, #32]
+    cbz  x0, 1f                  // host-owned: do not free
+    mov  x0, x20
+    bl   _free
+1:  adrp x1, str_incl_nest@page
+    add  x1, x1, str_incl_nest@pageoff
+    mov  x2, #20
+    bl   _sys_write
+    b    _include_fail
+
+_include_fail_msg:
+    bl   _fromlib_clear
+    adrp x1, str_cant_open@page
+    add  x1, x1, str_cant_open@pageoff
+    mov  x2, #12
+    bl   _sys_write
+    adrp x1, name_buf@page
+    add  x1, x1, name_buf@pageoff
+    adrp x2, include_path_len@page
+    add  x2, x2, include_path_len@pageoff
+    ldr  x2, [x2]
+    bl   _sys_write
+    adrp x1, str_nl@page
+    add  x1, x1, str_nl@pageoff
+    mov  x2, #1
+    bl   _sys_write
+_include_fail:
+    ldp  x19, x20, [sp], #48
+    b    _abort
 
 _word:
     adrp x1, source_addr@page
@@ -2093,37 +3643,156 @@ end_of_source:
     mov  x0, #0
     ret
 
+// _wordlist_register: x0 = wid. Append if not already present and room remains.
+_wordlist_register:
+    adrp x1, wordlist_reg_n@page
+    add  x1, x1, wordlist_reg_n@pageoff
+    ldr  x2, [x1]
+    adrp x3, wordlist_reg@page
+    add  x3, x3, wordlist_reg@pageoff
+    mov  x4, #0
+1:  cmp  x4, x2
+    b.hs 2f
+    ldr  x5, [x3, x4, lsl #3]
+    cmp  x5, x0
+    b.eq 3f
+    add  x4, x4, #1
+    b    1b
+2:  cmp  x2, #WORDLIST_REG_MAX
+    b.hs 3f
+    str  x0, [x3, x2, lsl #3]
+    add  x2, x2, #1
+    str  x2, [x1]
+3:  ret
+
+// _print_wid_name: x0 = wid. Prints FORTH, VOCABULARY name, or "wid".
+_print_wid_name:
+    stp  x29, x30, [sp, #-48]!
+    stp  x19, x20, [sp, #16]
+    stp  x21, x22, [sp, #32]
+    mov  x19, x0
+    adrp x1, latest_var@page
+    add  x1, x1, latest_var@pageoff
+    cmp  x19, x1
+    b.ne 1f
+    adrp x1, str_forth_name@page
+    add  x1, x1, str_forth_name@pageoff
+    mov  x2, #5
+    bl   _sys_write
+    b    9f
+1:  adrp x0, DODOES@page
+    add  x0, x0, DODOES@pageoff
+    mov  x22, x0
+    mov  x20, #0
+20: cmp  x20, #DICT_THREADS
+    b.hs 8f
+    adrp x0, latest_var@page
+    add  x0, x0, latest_var@pageoff
+    add  x0, x0, x20, lsl #3
+    ldr  x21, [x0]
+2:  cbz  x21, 21f
+    ldr  x0, [x21]
+    cmp  x0, x22
+    b.ne 3f
+    add  x0, x21, #16
+    cmp  x0, x19
+    b.ne 3f
+    ldr  x0, [x21, #-8]
+    and  x0, x0, #0xFFFF
+    sub  x0, x21, x0
+    ldrb w1, [x0], #1
+    mov  x2, #0
+4:  cmp  x2, x1
+    b.hs 9f
+    ldrb w3, [x0, x2]
+    stp  x0, x1, [sp, #-16]!
+    stp  x2, xzr, [sp, #-16]!
+    mov  x0, x3
+    bl   _putchar
+    ldp  x2, xzr, [sp], #16
+    ldp  x0, x1, [sp], #16
+    add  x2, x2, #1
+    b    4b
+3:  ldr  x21, [x21, #-16]
+    b    2b
+21: add  x20, x20, #1
+    b    20b
+8:  adrp x1, str_wid@page
+    add  x1, x1, str_wid@pageoff
+    mov  x2, #3
+    bl   _sys_write
+9:  ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #48
+    ret
+
+// _find: x0 = counted name → x0=CFA/0, x1=-1|1|0 (imm flag). Walks search order.
 _find:
-    adrp x2, latest_var@page
-    add  x2, x2, latest_var@pageoff
-    ldr  x2, [x2]
-1:  cbz  x2, 9f
-    ldr  x3, [x2, #-8]
+    stp  x19, x20, [sp, #-48]!
+    stp  x21, x22, [sp, #16]
+    str  x23, [sp, #32]
+    mov  x19, x0                   // counted name
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    ldr  x20, [x0]                 // n
+    cbz  x20, _find_fallback_forth
+    mov  x21, #0                   // order index
+_find_wl:
+    cmp  x21, x20
+    b.hs _find_miss
+    adrp x0, search_order@page
+    add  x0, x0, search_order@pageoff
+    ldr  x22, [x0, x21, lsl #3]    // wid
+    cbz  x22, _find_next_wl
+    ldr  x22, [x22]                // tip CFA (DICT_THREADS=1)
+_find_chain:
+    cbz  x22, _find_next_wl
+    ldr  x3, [x22, #-8]
     and  x4, x3, #0xFFFF
-    sub  x5, x2, x4
-    ldrb w6, [x0]
+    sub  x5, x22, x4               // NFA
+    ldrb w6, [x19]
     ldrb w7, [x5]
     cmp  w6, w7
-    b.ne 2f
-    add  x8, x0, #1
+    b.ne _find_next
+    add  x8, x19, #1
     add  x9, x5, #1
-0:  cbz  w6, 3f
+0:  cbz  w6, _find_hit
     ldrb w10, [x8], #1
     ldrb w11, [x9], #1
     cmp  w10, w11
-    b.ne 2f
+    b.ne _find_next
     sub  w6, w6, #1
     b    0b
-3:  tst  x3, #(1 << 63)
+_find_hit:
+    tst  x3, #(1 << 63)
     mov  x1, #-1
-    b.eq 4f
+    b.eq 1f
     mov  x1, #1
-4:  mov  x0, x2
+1:  mov  x0, x22
+    ldr  x23, [sp, #32]
+    ldp  x21, x22, [sp, #16]
+    ldp  x19, x20, [sp], #48
     ret
-2:  ldr  x2, [x2, #-16]
-    b    1b
-9:  mov  x0, #0
+_find_next:
+    ldr  x22, [x22, #-16]
+    b    _find_chain
+_find_next_wl:
+    add  x21, x21, #1
+    b    _find_wl
+_find_fallback_forth:
+    adrp x22, latest_var@page
+    add  x22, x22, latest_var@pageoff
+    ldr  x22, [x22]
+    mov  x20, #1
+    mov  x21, #0
+    // Fake a one-entry order using latest tip already in x22
+    b    _find_chain
+_find_miss:
+    mov  x0, #0
     mov  x1, #0
+    ldr  x23, [sp, #32]
+    ldp  x21, x22, [sp, #16]
+    ldp  x19, x20, [sp], #48
     ret
 
 _number:
@@ -2203,7 +3872,18 @@ _boot_kernel:
     ldp  x9, xzr, [sp], #16
     add  x9, x9, #32
     b    1b
-2:  ldp  x29, x30, [sp], #16
+2:  // TRAVERSE-WORDLIST continuation trampoline
+    adrp x0, XTW_CONTINUE@page
+    add  x0, x0, XTW_CONTINUE@pageoff
+    adrp x1, tw_continue_cfa@page
+    add  x1, x1, tw_continue_cfa@pageoff
+    str  x0, [x1]
+    adrp x0, tw_continue_cell@page
+    add  x0, x0, tw_continue_cell@pageoff
+    adrp x1, tw_continue_cfa@page
+    add  x1, x1, tw_continue_cfa@pageoff
+    str  x1, [x0]
+    ldp  x29, x30, [sp], #16
     ret
 
 _cache_one:
@@ -2313,8 +3993,9 @@ _interpret_run:
 _interpret_loop:
     bl   _check_data_stack
     cbnz x0, _abort
+    bl   _file_echo_upto
     bl   _word
-    cbz  x0, _interpret_done
+    cbz  x0, _interpret_empty
     ldrb w1, [x0]
     cbz  w1, _interpret_loop
 
@@ -2390,6 +4071,12 @@ _undef_current:
     bl   _sys_write
     b    _abort
     
+// End of current SOURCE: pop nested INCLUDE or finish this evaluate.
+_interpret_empty:
+    bl   _pop_source               // x0=1 restored outer
+    cbnz x0, _interpret_loop
+    b    _interpret_done
+
 _interpret_done:
     adrp x1, in_interpret@page
     add  x1, x1, in_interpret@pageoff
@@ -2433,17 +4120,26 @@ _stack_overflow:
 
 // ABORT: empty data + return stacks, leave compile state, then QUIT.
 _abort:
-    // If we were compiling, unlink the incomplete definition (LFA @ CFA-16).
+    // If compiling, unlink incomplete def from CURRENT tip via last_cfa.
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
     ldr  x1, [x0]
     cbz  x1, 1f
-    adrp x2, latest_var@page
-    add  x2, x2, latest_var@pageoff
+    adrp x2, last_cfa@page
+    add  x2, x2, last_cfa@pageoff
     ldr  x3, [x2]
     cbz  x3, 1f
-    ldr  x3, [x3, #-16]
-    str  x3, [x2]
+    adrp x4, current_var@page
+    add  x4, x4, current_var@pageoff
+    ldr  x4, [x4]
+    cbnz x4, 0f
+    adrp x4, latest_var@page
+    add  x4, x4, latest_var@pageoff
+0:  ldr  x5, [x4]
+    cmp  x5, x3
+    b.ne 1f
+    ldr  x5, [x3, #-16]
+    str  x5, [x4]
 1:  str  xzr, [x0]                  // STATE = 0
     adrp x0, compiling_native@page
     add  x0, x0, compiling_native@pageoff
@@ -2463,7 +4159,17 @@ _abort:
     adrp x0, inline_var@page
     add  x0, x0, inline_var@pageoff
     str  x1, [x0]
-2:  adrp x22, data_stack@page
+2:  // Unwind nested INCLUDE frames (free malloc'd file buffers).
+3:  bl   _pop_source
+    cbnz x0, 3b
+    // Pin base SOURCE >IN to end so remainder of this evaluate is skipped.
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    ldr  x0, [x0]
+    adrp x1, to_in@page
+    add  x1, x1, to_in@pageoff
+    str  x0, [x1]
+    adrp x22, data_stack@page
     add  x22, x22, data_stack@pageoff
     add  x22, x22, #DSTACK_SIZE
     adrp x23, return_stack@page
@@ -3441,7 +5147,24 @@ _kernel_cold_start:
     
     adrp x24, latest_var@page
     add  x24, x24, latest_var@pageoff
-    str  xzr, [x24]
+    // Clear FORTH heads (DICT_THREADS cells)
+    mov  x0, x24
+    mov  x1, #DICT_THREADS
+1:  str  xzr, [x0], #8
+    subs x1, x1, #1
+    b.ne 1b
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
+    str  xzr, [x0]
+    adrp x0, wordlist_reg_n@page
+    add  x0, x0, wordlist_reg_n@pageoff
+    str  xzr, [x0]
+    adrp x0, search_order_n@page
+    add  x0, x0, search_order_n@pageoff
+    str  xzr, [x0]
+    adrp x0, current_var@page
+    add  x0, x0, current_var@pageoff
+    str  xzr, [x0]
 
     adrp x0, here_ptr@page
     add  x0, x0, here_ptr@pageoff
@@ -3453,7 +5176,32 @@ _kernel_cold_start:
     add  x0, x0, state_var@pageoff
     str  xzr, [x0]
 
+    adrp x0, source_sp@page
+    add  x0, x0, source_sp@pageoff
+    str  xzr, [x0]
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
+    str  xzr, [x0]
+    adrp x0, included_count@page
+    add  x0, x0, included_count@pageoff
+    str  xzr, [x0]
+
     bl   _boot_kernel
+    // Search-Order defaults: CURRENT = FORTH, order = (FORTH), register FORTH
+    adrp x0, latest_var@page
+    add  x0, x0, latest_var@pageoff
+    adrp x1, current_var@page
+    add  x1, x1, current_var@pageoff
+    str  x0, [x1]
+    adrp x1, search_order@page
+    add  x1, x1, search_order@pageoff
+    str  x0, [x1]
+    mov  x1, #1
+    adrp x2, search_order_n@page
+    add  x2, x2, search_order_n@pageoff
+    str  x1, [x2]
+    bl   _wordlist_register
+
     bl   _boot_cache
 
     adrp x0, forth_source@page
@@ -3519,6 +5267,7 @@ _kernel_data_depth:
     ret
 
 // CLI entry retained for reference builds; not used by the .app (Swift @main).
+.globl _cli_main
 _cli_main:
     stp  x29, x30, [sp, #-16]!
     bl   _forth_io_init
@@ -3565,7 +5314,7 @@ forth_source_end:
 .section __TEXT,__const
 .align 3
 banner:
-    .ascii "16Forth 0.3 ready\n"
+    .ascii "16Forth 0.4 ready\n"
 .equ banner_len, . - banner
 
 .align 3
@@ -3601,6 +5350,31 @@ str_noinline:
     .ascii " cannot inline: "
 str_noinline_nl:
     .ascii "\n"
+
+.align 3
+str_cant_open:
+    .ascii "can't open: "
+.align 3
+str_incl_need:
+    .ascii "INCLUDE needs name\n"
+.align 3
+str_incl_nest:
+    .ascii "INCLUDE too nested\n"
+.align 3
+str_included_hdr:
+    .ascii "Included:\n"
+.align 3
+str_search_order:
+    .ascii "Search order: "
+.align 3
+str_comp_wl:
+    .ascii "Compilation wordlist: "
+.align 3
+str_forth_name:
+    .ascii "FORTH"
+.align 3
+str_wid:
+    .ascii "wid"
 
 .align 3
 cnt_lit:        .byte 3, 'L','I','T'

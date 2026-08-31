@@ -133,7 +133,7 @@ Skip for v1: `FacilityTerminal`, `ForthApplication` principal class, FileAccess/
 
 ---
 
-## Status — v0.3 (shipped beyond original v1 plan)
+## Status — v0.4 (shipped beyond original v1 plan)
 
 The console `.app` goal above is met. Engine work after the first green app includes:
 
@@ -144,8 +144,12 @@ The console `.app` goal above is met. Engine work after the first green app incl
 | `I:` macros | Nested expand; LIT + relative `BRANCH`/`0BRANCH` reloc. |
 | Control immediates | Asm native-aware `IF`…`THEN`, `BEGIN`…, `DO`/`?DO`/`LOOP`/`+LOOP`. |
 | Loop indices | `I` / `J` / `K`; inlinable so native loops are correct. |
-| Startup | Banner **16Forth 0.3 ready**; app marketing version **0.3**. |
+| Startup | Banner **16Forth 0.4 ready**; app marketing version **0.4**. |
+| `SEE` / `HELP` | 64Forth-style ITC decompiler: colon walk until `EXIT`; `LIT`, `(S")`, `BRANCH`/`0BRANCH`, `(?DO)`/`(LOOP)`/`(+LOOP)` offsets; `(DO)` name-only; CODE/native → `(primitive)`; `I:` tag when FFA inline. |
+| Timing | `MS@` / `MS`; pictured `<# # #S #>` / `BASE`/`DECIMAL`/`HEX`; `ELAPSED` / `.ELAPSED`. |
+| INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/`. |
+| Vocabularies | ANS Search-Order + 64Forth extras: `VOCABULARY`, `ORDER`, `WORDLIST`, `TRAVERSE-WORDLIST`, `.VOCABULARIES`; starters `EDITOR`/`ASSEMBLER`/`FP`/`BIG-INTEGER`. |
 
-Still deferred vs a full 64Forth-class IDE: `S"` inside `I:`/native expand, SEE/decompiler polish, shared engine tree with 16ForthCLI, menus / INCLUDE panel / icon.
+Still deferred vs a full 64Forth-class IDE: `S"` inside `I:`/native expand, ARM disassembly of native JIT bodies, shared engine tree with 16ForthCLI, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon.
 
 Original note that `kernel.fth` would stay unchanged is historical — high-level words now use `I:` where useful, and DO-family immediates live in asm.

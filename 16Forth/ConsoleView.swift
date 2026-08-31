@@ -17,7 +17,7 @@ extension Notification.Name {
     static let clearConsole = Notification.Name("SixteenForthClearConsole")
 }
 
-private let banner = "=== 16Forth 0.3 ===\n"
+private let banner = "=== 16Forth 0.4 ===\n"
 
 struct ConsoleView: View {
     @State private var consoleText = banner
@@ -226,9 +226,13 @@ struct ConsoleView: View {
         historyIndex = -1
 
         isProgrammaticConsoleAppend = true
+        kernel.clearReplBatchStop()
         for line in candidateLines {
             _ = kernel.evaluate(line)
             markProtectedThroughEndOfText()
+            if kernel.replBatchStopRequested {
+                break
+            }
         }
         if !consoleText.hasSuffix("\n") {
             consoleText += "\n"

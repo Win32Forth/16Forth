@@ -160,3 +160,57 @@ long long host_file_op(long long op,
         return -1;
     }
 }
+
+/*
+ * host_load_entire — read a whole file for INCLUDE / INCLUDED.
+ * path need not be NUL-terminated (path_len bytes).
+ * On success: *out_buf is malloc'd (caller frees), *out_len is byte count,
+ * returns 0. On failure returns errno (or -1) and leaves *out_buf untouched.
+ */
+long long host_load_entire(const char *path, long long path_len,
+                           void **out_buf, long long *out_len)
+{
+    char name[1024];
+    if (!path || path_len <= 0 || path_len >= (long long)sizeof(name))
+        return -1;
+    memcpy(name, path, (size_t)path_len);
+    name[path_len] = 0;
+
+    FILE *f = fopen(name, "rb");
+    if (!f)
+        return (long long)errno;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        long long e = (long long)errno;
+        fclose(f);
+        return e;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        long long e = (long long)errno;
+        fclose(f);
+        return e;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        long long e = (long long)errno;
+        fclose(f);
+        return e;
+    }
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return -1;
+    }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    int err = ferror(f);
+    fclose(f);
+    if (err) {
+        free(buf);
+        return (long long)errno;
+    }
+    buf[n] = 0;
+    if (out_buf) *out_buf = buf;
+    if (out_len) *out_len = (long long)n;
+    return 0;
+}

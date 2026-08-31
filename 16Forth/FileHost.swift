@@ -1,0 +1,604 @@
+//
+//  FileHost.swift
+//  16Forth
+//
+//  Public domain.
+//
+//  Slim port of 64Forth FileHost: FROMLIB, INCLUDE/FLOAD load hooks,
+//  CHDIR/PWD/DIR, nested load cwd, bare open panel.
+//
+
+import Foundation
+import UniformTypeIdentifiers
+import AppKit
+
+/// Host-side directories and resolve rules for INCLUDE / FLOAD / FROMLIB.
+final class FileHost {
+    static let shared = FileHost()
+
+    /// Logical session cwd (may differ from process cwd).
+    var logicalCurrentDirectory: String
+
+    /// When true, next path resolve uses bundle Library (FROMLIB).
+    private(set) var fromLibraryArmed = false
+
+    /// Start directory for the next bare FLOAD/CHDIR open panel.
+    var fileDialogStartDirectoryOverride: String?
+
+    /// When true, bare FLOAD after FROMLIB must not leave session cwd at Library.
+    var preserveSessionCwdAfterFileOp = false
+
+    /// Saved cwd frames while a FROMLIB *named* load is in progress (nested-safe).
+    private var fromLibraryDirStack: [(logical: String, process: String)] = []
+
+    /// Saved cwd frames while a file INCLUDE/FLOAD is active (nested-safe).
+    private var loadCwdStack: [(logical: String, process: String)] = []
+
+    /// Pinned INCLUDE buffers for the current kernel_eval (nested INCLUDE).
+    private var includeAllocs: [UnsafeMutablePointer<CChar>] = []
+
+    private(set) var lastLoadError: String?
+
+    /// Absolute standardized path of the last successful load (REQUIRE registry key).
+    private(set) var lastLoadRegistryKey: String?
+
+    var onMessage: ((String) -> Void)?
+
+    private var scopedBookmarkData: [Data] = []
+    private let bookmarksDefaultsKey = "SixteenForth.SecurityScopedBookmarks"
+    private let lastCwdDefaultsKey = "SixteenForth.LastLogicalCwd"
+
+    private init() {
+        logicalCurrentDirectory = FileManager.default.currentDirectoryPath
+        restorePersistedAccess()
+    }
+
+    private func msg(_ s: String) {
+        onMessage?(s)
+    }
+
+    /// Create and run an NSOpenPanel on the main thread.
+    private func pickWithOpenPanelOnMain(
+        configure: @escaping (NSOpenPanel) -> Void
+    ) -> URL? {
+        if Thread.isMainThread {
+            let panel = NSOpenPanel()
+            configure(panel)
+            guard panel.runModal() == .OK else { return nil }
+            return panel.url
+        }
+        var picked: URL?
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            let panel = NSOpenPanel()
+            configure(panel)
+            if panel.runModal() == .OK {
+                picked = panel.url
+            }
+            done.signal()
+        }
+        while done.wait(timeout: .now() + 0.05) == .timedOut {
+            // Main evaluate loop processes this async block while pumping UI.
+        }
+        return picked
+    }
+
+    // MARK: - Bundle roots
+
+    var resourcesURL: URL? {
+        Bundle.main.resourceURL
+    }
+
+    var libraryURL: URL? {
+        if let root = resourcesURL {
+            let dir = root.appendingPathComponent("Library", isDirectory: true)
+            if FileManager.default.fileExists(atPath: dir.path) { return dir }
+        }
+        if let u = Bundle.main.url(forResource: "Library", withExtension: nil) {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue {
+                return u
+            }
+        }
+        return nil
+    }
+
+    // MARK: - FROMLIB
+
+    func armFromLibrary() {
+        fromLibraryArmed = true
+    }
+
+    func clearFromLibrary() {
+        fromLibraryArmed = false
+    }
+
+    private func isAbsoluteOrHome(_ spec: String) -> Bool {
+        let s = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.hasPrefix("/") || s.hasPrefix("~")
+    }
+
+    /// Normalize leaf: append `.fth` when no extension.
+    func normalizeSourceSpec(_ spec: String) -> String {
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        let leaf = (trimmed as NSString).lastPathComponent
+        if leaf.isEmpty || leaf.contains(".") { return trimmed }
+        return trimmed + ".fth"
+    }
+
+    /// Resolve a load name for FLOAD/INCLUDE/REQUIRE.
+    func resolveLoadPath(_ name: String, switchCwdForFromLib: Bool = true) -> URL? {
+        var n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if n.isEmpty { return nil }
+
+        if n.hasPrefix("~") {
+            n = NSString(string: n).expandingTildeInPath
+        }
+
+        if n.hasPrefix("/") {
+            return URL(fileURLWithPath: n)
+        }
+
+        n = normalizeSourceSpec(n)
+
+        let armed = fromLibraryArmed
+        let base: URL
+        if armed, let lib = libraryURL {
+            clearFromLibrary()
+            base = lib
+            if switchCwdForFromLib {
+                pushFromLibrarySessionFrame()
+            }
+        } else {
+            if armed {
+                clearFromLibrary()
+                lastLoadError = "FROMLIB: Resources/Library not found in app bundle"
+                return nil
+            }
+            base = URL(fileURLWithPath: logicalCurrentDirectory, isDirectory: true)
+        }
+
+        let path = (base.path as NSString).appendingPathComponent(n)
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
+
+    /// Resolve a load name to an absolute registry key (consumes FROMLIB).
+    func resolveRegistryKey(path: UnsafePointer<CChar>?, pathLen: Int) -> String? {
+        guard let path, pathLen > 0 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: pathLen)
+        for i in 0..<pathLen { bytes[i] = UInt8(bitPattern: path[i]) }
+        let raw = String(bytes: bytes, encoding: .utf8) ?? ""
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let url = resolveLoadPath(name, switchCwdForFromLib: false) else { return nil }
+        return url.standardizedFileURL.path
+    }
+
+    private func pushFromLibrarySessionFrame() {
+        let frame = (logical: logicalCurrentDirectory, process: FileManager.default.currentDirectoryPath)
+        fromLibraryDirStack.append(frame)
+    }
+
+    func endFromLibraryLoadIfNeeded() {
+        guard let frame = fromLibraryDirStack.popLast() else { return }
+        logicalCurrentDirectory = frame.logical
+        let proc = frame.process.isEmpty ? frame.logical : frame.process
+        if !proc.isEmpty {
+            _ = FileManager.default.changeCurrentDirectoryPath(proc)
+        }
+    }
+
+    func endAllFromLibraryLoads() {
+        while !fromLibraryDirStack.isEmpty {
+            endFromLibraryLoadIfNeeded()
+        }
+    }
+
+    // MARK: - Per-file load cwd
+
+    private func beginLoadCwd(forFileURL url: URL) {
+        let parent = url.deletingLastPathComponent().path
+        let frame = (logical: logicalCurrentDirectory, process: FileManager.default.currentDirectoryPath)
+        loadCwdStack.append(frame)
+        logicalCurrentDirectory = parent
+        _ = FileManager.default.changeCurrentDirectoryPath(parent)
+    }
+
+    func endLoadCwdIfNeeded() {
+        guard let frame = loadCwdStack.popLast() else { return }
+        logicalCurrentDirectory = frame.logical
+        let proc = frame.process.isEmpty ? frame.logical : frame.process
+        if !proc.isEmpty {
+            _ = FileManager.default.changeCurrentDirectoryPath(proc)
+        }
+    }
+
+    func endAllLoadCwds() {
+        while !loadCwdStack.isEmpty {
+            endLoadCwdIfNeeded()
+        }
+    }
+
+    // MARK: - CHDIR / PWD
+
+    func changeDirectory(spec: String) {
+        let s = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty {
+            presentDirectoryPicker()
+            return
+        }
+
+        if fromLibraryArmed {
+            clearFromLibrary()
+            if !isAbsoluteOrHome(s), let lib = libraryURL {
+                let expanded = (s as NSString).expandingTildeInPath
+                let target = (lib.path as NSString).appendingPathComponent(expanded)
+                applyChdir(URL(fileURLWithPath: target).standardizedFileURL)
+                return
+            }
+        }
+
+        let expanded = (s as NSString).expandingTildeInPath
+        let newURL: URL
+        if expanded.hasPrefix("/") {
+            newURL = URL(fileURLWithPath: expanded)
+        } else {
+            newURL = URL(fileURLWithPath: logicalCurrentDirectory)
+                .appendingPathComponent(expanded)
+                .standardizedFileURL
+        }
+        applyChdir(newURL)
+    }
+
+    func presentDirectoryPicker() {
+        let startDir: URL
+        if fromLibraryArmed {
+            clearFromLibrary()
+            if let lib = libraryURL {
+                startDir = lib
+            } else {
+                startDir = URL(fileURLWithPath: logicalCurrentDirectory, isDirectory: true)
+            }
+        } else if let override = fileDialogStartDirectoryOverride {
+            startDir = URL(fileURLWithPath: override, isDirectory: true)
+            fileDialogStartDirectoryOverride = nil
+        } else {
+            startDir = URL(fileURLWithPath: logicalCurrentDirectory, isDirectory: true)
+        }
+
+        guard let url = pickWithOpenPanelOnMain(configure: { panel in
+            panel.canChooseFiles = false
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.prompt = "Choose"
+            panel.message = "CHDIR — set working directory"
+            panel.directoryURL = startDir
+        }) else {
+            msg("(CHDIR cancelled)\n")
+            return
+        }
+        applyChdir(url)
+    }
+
+    private func applyChdir(_ url: URL) {
+        endAllLoadCwds()
+        endAllFromLibraryLoads()
+        clearFromLibrary()
+        logicalCurrentDirectory = url.path
+        _ = FileManager.default.changeCurrentDirectoryPath(url.path)
+        rememberScopedURL(url)
+        UserDefaults.standard.set(url.path, forKey: lastCwdDefaultsKey)
+        msg("Current directory: \(logicalCurrentDirectory)\n")
+    }
+
+    func printPwd() {
+        msg("Current directory: \(logicalCurrentDirectory)\n")
+    }
+
+    // MARK: - DIR
+
+    func listDirectory(spec: String) {
+        let fm = FileManager.default
+        var basePath = logicalCurrentDirectory
+        var filter = ""
+        let raw = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if fromLibraryArmed {
+            clearFromLibrary()
+            if let lib = libraryURL {
+                if raw.isEmpty {
+                    emitDirectoryListing(of: lib.path, filter: "")
+                    return
+                }
+                if !isAbsoluteOrHome(raw) {
+                    let expanded = (raw as NSString).expandingTildeInPath
+                    let hasWild = expanded.contains("*") || expanded.contains("?")
+                    if hasWild {
+                        if let lastSlash = expanded.lastIndex(of: "/") {
+                            let dirPart = String(expanded[..<lastSlash])
+                            filter = String(expanded[expanded.index(after: lastSlash)...])
+                            let dirPath = dirPart.isEmpty
+                                ? lib.path
+                                : (lib.path as NSString).appendingPathComponent(dirPart)
+                            emitDirectoryListing(of: dirPath, filter: filter)
+                        } else {
+                            emitDirectoryListing(of: lib.path, filter: expanded)
+                        }
+                    } else {
+                        let target = (lib.path as NSString).appendingPathComponent(expanded)
+                        var isD: ObjCBool = false
+                        if fm.fileExists(atPath: target, isDirectory: &isD), isD.boolValue {
+                            emitDirectoryListing(of: target, filter: "")
+                        } else {
+                            emitDirectoryListing(of: lib.path, filter: expanded)
+                        }
+                    }
+                    return
+                }
+            } else {
+                msg("DIR: FROMLIB armed but Resources/Library missing\n")
+                return
+            }
+        }
+
+        if !raw.isEmpty {
+            let expanded = (raw as NSString).expandingTildeInPath
+            let hasWild = expanded.contains("*") || expanded.contains("?")
+            if hasWild {
+                if let lastSlash = expanded.lastIndex(of: "/") {
+                    let dirPart = String(expanded[..<lastSlash])
+                    filter = String(expanded[expanded.index(after: lastSlash)...])
+                    if dirPart.isEmpty {
+                        basePath = "/"
+                    } else {
+                        let dirExpanded = (dirPart as NSString).expandingTildeInPath
+                        if dirExpanded.hasPrefix("/") {
+                            basePath = dirExpanded
+                        } else {
+                            basePath = (basePath as NSString).appendingPathComponent(dirExpanded)
+                        }
+                    }
+                } else {
+                    filter = expanded
+                }
+            } else {
+                let testURL: URL
+                if expanded.hasPrefix("/") {
+                    testURL = URL(fileURLWithPath: expanded)
+                } else {
+                    testURL = URL(fileURLWithPath: basePath).appendingPathComponent(expanded)
+                }
+                var isD: ObjCBool = false
+                if fm.fileExists(atPath: testURL.path, isDirectory: &isD), isD.boolValue {
+                    basePath = testURL.path
+                    filter = ""
+                } else {
+                    filter = expanded
+                }
+            }
+        }
+
+        emitDirectoryListing(of: basePath, filter: filter)
+    }
+
+    private func emitDirectoryListing(of basePath: String, filter: String) {
+        let fm = FileManager.default
+        let listURL = URL(fileURLWithPath: basePath)
+        do {
+            let contents = try fm.contentsOfDirectory(
+                at: listURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+            msg("\nDirectory of \(listURL.path)\n\n")
+            var count = 0
+            for fileURL in contents.sorted(by: {
+                $0.lastPathComponent.lowercased() < $1.lastPathComponent.lowercased()
+            }) {
+                let name = fileURL.lastPathComponent
+                if !filter.isEmpty, !matchesWildcard(filter, in: name) {
+                    continue
+                }
+                var isDir: ObjCBool = false
+                fm.fileExists(atPath: fileURL.path, isDirectory: &isDir)
+                if isDir.boolValue {
+                    let padded = name.padding(toLength: 30, withPad: " ", startingAt: 0)
+                    msg(" \(padded) <DIR>\n")
+                } else {
+                    let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                    let padded = name.padding(toLength: 30, withPad: " ", startingAt: 0)
+                    let sizeStr = String(size).padding(toLength: 12, withPad: " ", startingAt: 0)
+                    msg(" \(padded) \(sizeStr)\n")
+                }
+                count += 1
+            }
+            msg("\n \(count) file(s)\n\n")
+        } catch {
+            msg("DIR error: Cannot read directory '\(listURL.path)'\n")
+            msg("  (Use bare FLOAD or CHDIR to open/authorize a folder if access fails.)\n")
+        }
+    }
+
+    private func matchesWildcard(_ pattern: String, in name: String) -> Bool {
+        let regexPattern = "^" + NSRegularExpression.escapedPattern(for: pattern)
+            .replacingOccurrences(of: "\\*", with: ".*")
+            .replacingOccurrences(of: "\\?", with: ".")
+            + "$"
+        guard let regex = try? NSRegularExpression(pattern: regexPattern, options: .caseInsensitive) else {
+            return false
+        }
+        let range = NSRange(location: 0, length: name.utf16.count)
+        return regex.firstMatch(in: name, options: [], range: range) != nil
+    }
+
+    // MARK: - Bookmarks / persistence
+
+    private func rememberScopedURL(_ url: URL) {
+        let opts: URL.BookmarkCreationOptions = [.withSecurityScope]
+        guard let data = try? url.bookmarkData(
+            options: opts,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        ) else { return }
+        scopedBookmarkData.removeAll { $0 == data }
+        scopedBookmarkData.append(data)
+        if scopedBookmarkData.count > 32 {
+            scopedBookmarkData.removeFirst(scopedBookmarkData.count - 32)
+        }
+        UserDefaults.standard.set(scopedBookmarkData, forKey: bookmarksDefaultsKey)
+    }
+
+    private func restorePersistedAccess() {
+        if let path = UserDefaults.standard.string(forKey: lastCwdDefaultsKey),
+           !path.isEmpty {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
+                logicalCurrentDirectory = path
+                _ = FileManager.default.changeCurrentDirectoryPath(path)
+            }
+        }
+        if let saved = UserDefaults.standard.array(forKey: bookmarksDefaultsKey) as? [Data] {
+            scopedBookmarkData = saved
+            for data in scopedBookmarkData {
+                var isStale = false
+                let resolveOpts: URL.BookmarkResolutionOptions = [.withSecurityScope]
+                guard let url = try? URL(
+                    resolvingBookmarkData: data,
+                    options: resolveOpts,
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &isStale
+                ) else { continue }
+                _ = url.startAccessingSecurityScopedResource()
+            }
+        }
+    }
+
+    // MARK: - Load for kernel hook
+
+    /// Kernel load_file_hook. path_len == 0 → bare FLOAD dialog.
+    func loadFileForKernel(
+        path: UnsafePointer<CChar>?,
+        pathLen: Int,
+        outPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+        outLen: UnsafeMutablePointer<Int>?
+    ) -> Int32 {
+        lastLoadError = nil
+
+        if path == nil || pathLen == 0 {
+            return loadViaOpenPanel(outPtr: outPtr, outLen: outLen)
+        }
+
+        let name = String(cString: path!)
+        guard let url = resolveLoadPath(name) else {
+            let err = lastLoadError ?? "can't open: \(name) (resolve failed)"
+            lastLoadError = err
+            msg(err + "\n")
+            if libraryURL == nil {
+                msg("  hint: Library missing from app bundle — check Copy Bundle Resources\n")
+            } else {
+                msg("  Working folder: \(logicalCurrentDirectory)\n")
+                msg("  Library: \(libraryURL?.path ?? "—")\n")
+                msg("  try: FROMLIB FLOAD \(normalizeSourceSpec(name))\n")
+                msg("  or:  CHDIR then FLOAD, or bare FLOAD (dialog)\n")
+            }
+            return -1
+        }
+
+        return pinFileContents(url: url, displayName: name, outPtr: outPtr, outLen: outLen)
+    }
+
+    private func loadViaOpenPanel(
+        outPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+        outLen: UnsafeMutablePointer<Int>?
+    ) -> Int32 {
+        let startDir: URL
+        if fromLibraryArmed, let lib = libraryURL {
+            clearFromLibrary()
+            startDir = lib
+            preserveSessionCwdAfterFileOp = true
+        } else if let override = fileDialogStartDirectoryOverride {
+            startDir = URL(fileURLWithPath: override, isDirectory: true)
+            fileDialogStartDirectoryOverride = nil
+        } else {
+            clearFromLibrary()
+            startDir = URL(fileURLWithPath: logicalCurrentDirectory, isDirectory: true)
+        }
+
+        guard let url = pickWithOpenPanelOnMain(configure: { panel in
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.allowedContentTypes = [
+                UTType(filenameExtension: "fth") ?? .plainText,
+                UTType(filenameExtension: "fs") ?? .plainText,
+                UTType(filenameExtension: "4th") ?? .plainText,
+                .plainText
+            ]
+            panel.prompt = "Load"
+            panel.message = "FLOAD / INCLUDE — choose a Forth source file"
+            panel.directoryURL = startDir
+        }) else {
+            msg("(FLOAD cancelled)\n")
+            preserveSessionCwdAfterFileOp = false
+            return -1
+        }
+
+        if !preserveSessionCwdAfterFileOp {
+            let parent = url.deletingLastPathComponent()
+            logicalCurrentDirectory = parent.path
+            _ = FileManager.default.changeCurrentDirectoryPath(parent.path)
+            rememberScopedURL(parent)
+            rememberScopedURL(url)
+            UserDefaults.standard.set(parent.path, forKey: lastCwdDefaultsKey)
+            msg("Current directory: \(logicalCurrentDirectory)\n")
+        } else {
+            rememberScopedURL(url)
+        }
+        preserveSessionCwdAfterFileOp = false
+
+        return pinFileContents(url: url, displayName: url.lastPathComponent, outPtr: outPtr, outLen: outLen)
+    }
+
+    private func pinFileContents(
+        url: URL,
+        displayName: String,
+        outPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+        outLen: UnsafeMutablePointer<Int>?
+    ) -> Int32 {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let err = "can't open: \(displayName)\n  path: \(url.path)\n  \(error.localizedDescription)"
+            lastLoadError = err
+            msg(err + "\n")
+            return -1
+        }
+
+        let maxBytes = 262_144
+        let n = min(data.count, maxBytes)
+        if data.count > maxBytes {
+            msg("(warning: \(displayName) truncated to \(maxBytes) bytes)\n")
+        }
+        let p = UnsafeMutablePointer<CChar>.allocate(capacity: n + 1)
+        if n > 0 {
+            data.copyBytes(to: UnsafeMutableRawPointer(p).assumingMemoryBound(to: UInt8.self), count: n)
+        }
+        p[n] = 0
+        includeAllocs.append(p)
+
+        beginLoadCwd(forFileURL: url)
+
+        lastLoadRegistryKey = url.standardizedFileURL.path
+        outPtr?.pointee = UnsafePointer(p)
+        outLen?.pointee = n
+        return 0
+    }
+
+    func releaseIncludeBuffers() {
+        for p in includeAllocs {
+            p.deallocate()
+        }
+        includeAllocs.removeAll()
+    }
+}

@@ -4,7 +4,7 @@
 //
 //  Public domain.
 //
-//  Slim host bridge: emit hooks, cold start, line eval on a serial queue.
+//  Slim host bridge: emit hooks, file/INCLUDE hooks, cold start, line eval.
 //
 
 import Foundation
@@ -25,6 +25,61 @@ func kernel_set_emit(_ fn: (@convention(c) (Int32) -> Void)?)
 @_silgen_name("kernel_set_emit_buf")
 func kernel_set_emit_buf(_ fn: (@convention(c) (UnsafePointer<CChar>?, Int) -> Void)?)
 
+@_silgen_name("kernel_set_fromlib")
+private func kernel_set_fromlib(_ fn: (@convention(c) () -> Void)?)
+
+@_silgen_name("kernel_set_fromlib_clear")
+private func kernel_set_fromlib_clear(_ fn: (@convention(c) () -> Void)?)
+
+@_silgen_name("kernel_set_end_include")
+private func kernel_set_end_include(_ fn: (@convention(c) () -> Void)?)
+
+@_silgen_name("kernel_set_load_file")
+private func kernel_set_load_file(
+    _ fn: (@convention(c) (
+        UnsafePointer<CChar>?,
+        Int,
+        UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+        UnsafeMutablePointer<Int>?
+    ) -> Int32)?
+)
+
+@_silgen_name("kernel_set_resolve_key")
+private func kernel_set_resolve_key(
+    _ fn: (@convention(c) (
+        UnsafePointer<CChar>?,
+        Int,
+        UnsafeMutablePointer<CChar>?,
+        Int,
+        UnsafeMutablePointer<Int>?
+    ) -> Int32)?
+)
+
+@_silgen_name("kernel_set_last_load_key")
+private func kernel_set_last_load_key(
+    _ fn: (@convention(c) (
+        UnsafeMutablePointer<CChar>?,
+        Int,
+        UnsafeMutablePointer<Int>?
+    ) -> Int32)?
+)
+
+@_silgen_name("kernel_set_chdir")
+private func kernel_set_chdir(
+    _ fn: (@convention(c) (UnsafePointer<CChar>?, Int) -> Void)?
+)
+
+@_silgen_name("kernel_set_pwd")
+private func kernel_set_pwd(_ fn: (@convention(c) () -> Void)?)
+
+@_silgen_name("kernel_set_dir")
+private func kernel_set_dir(
+    _ fn: (@convention(c) (UnsafePointer<CChar>?, Int) -> Void)?
+)
+
+@_silgen_name("kernel_take_repl_batch_stop")
+private func kernel_take_repl_batch_stop() -> Int32
+
 @_silgen_name("forth_io_init")
 func forth_io_init()
 
@@ -39,11 +94,90 @@ private let kernelEmitBufTrampoline: @convention(c) (UnsafePointer<CChar>?, Int)
     kernelHookTarget?.handleEmitBytes(buf, count: n)
 }
 
+private let kernelFromlibTrampoline: @convention(c) () -> Void = {
+    FileHost.shared.armFromLibrary()
+}
+
+private let kernelFromlibClearTrampoline: @convention(c) () -> Void = {
+    FileHost.shared.clearFromLibrary()
+}
+
+private let kernelEndIncludeTrampoline: @convention(c) () -> Void = {
+    FileHost.shared.endLoadCwdIfNeeded()
+}
+
+private let kernelLoadFileTrampoline: @convention(c) (
+    UnsafePointer<CChar>?,
+    Int,
+    UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+    UnsafeMutablePointer<Int>?
+) -> Int32 = { path, pathLen, outPtr, outLen in
+    FileHost.shared.loadFileForKernel(
+        path: path,
+        pathLen: pathLen,
+        outPtr: outPtr,
+        outLen: outLen
+    )
+}
+
+private let kernelResolveKeyTrampoline: @convention(c) (
+    UnsafePointer<CChar>?,
+    Int,
+    UnsafeMutablePointer<CChar>?,
+    Int,
+    UnsafeMutablePointer<Int>?
+) -> Int32 = { path, pathLen, out, outMax, outLen in
+    guard let key = FileHost.shared.resolveRegistryKey(path: path, pathLen: pathLen),
+          let out, outMax > 0 else { return -1 }
+    let bytes = Array(key.utf8)
+    let n = min(bytes.count, outMax)
+    for i in 0..<n { out[i] = CChar(bitPattern: bytes[i]) }
+    outLen?.pointee = n
+    return 0
+}
+
+private let kernelLastLoadKeyTrampoline: @convention(c) (
+    UnsafeMutablePointer<CChar>?,
+    Int,
+    UnsafeMutablePointer<Int>?
+) -> Int32 = { out, outMax, outLen in
+    guard let key = FileHost.shared.lastLoadRegistryKey, !key.isEmpty,
+          let out, outMax > 0 else { return -1 }
+    let bytes = Array(key.utf8)
+    let n = min(bytes.count, outMax)
+    for i in 0..<n { out[i] = CChar(bitPattern: bytes[i]) }
+    outLen?.pointee = n
+    return 0
+}
+
+private let kernelChdirTrampoline: @convention(c) (UnsafePointer<CChar>?, Int) -> Void = { path, pathLen in
+    if path == nil || pathLen == 0 {
+        FileHost.shared.presentDirectoryPicker()
+    } else {
+        FileHost.shared.changeDirectory(spec: String(cString: path!))
+    }
+}
+
+private let kernelPwdTrampoline: @convention(c) () -> Void = {
+    FileHost.shared.printPwd()
+}
+
+private let kernelDirTrampoline: @convention(c) (UnsafePointer<CChar>?, Int) -> Void = { path, pathLen in
+    if path == nil || pathLen == 0 {
+        FileHost.shared.listDirectory(spec: "")
+    } else {
+        FileHost.shared.listDirectory(spec: String(cString: path!))
+    }
+}
+
 final class KernelBridge {
     static let shared = KernelBridge()
 
     /// Called on the main queue with decoded engine output.
     var onEmit: ((String) -> Void)?
+
+    /// Set when `\S` runs on console SOURCE; host may stop remaining paste lines.
+    private(set) var replBatchStopRequested = false
 
     private let forthQueue = DispatchQueue(label: "16Forth.kernel")
     private let evalLock = NSLock()
@@ -58,6 +192,22 @@ final class KernelBridge {
         kernelHookTarget = self
         kernel_set_emit(kernelEmitTrampoline)
         kernel_set_emit_buf(kernelEmitBufTrampoline)
+        installFileHooks()
+        FileHost.shared.onMessage = { [weak self] s in
+            self?.handleEmitString(s)
+        }
+    }
+
+    private func installFileHooks() {
+        kernel_set_fromlib(kernelFromlibTrampoline)
+        kernel_set_fromlib_clear(kernelFromlibClearTrampoline)
+        kernel_set_end_include(kernelEndIncludeTrampoline)
+        kernel_set_load_file(kernelLoadFileTrampoline)
+        kernel_set_resolve_key(kernelResolveKeyTrampoline)
+        kernel_set_last_load_key(kernelLastLoadKeyTrampoline)
+        kernel_set_chdir(kernelChdirTrampoline)
+        kernel_set_pwd(kernelPwdTrampoline)
+        kernel_set_dir(kernelDirTrampoline)
     }
 
     /// Start the engine once (JIT buffer + cold start). Safe to call repeatedly.
@@ -72,6 +222,9 @@ final class KernelBridge {
 
         forth_io_init()
         kernel_cold_start()
+        FileHost.shared.releaseIncludeBuffers()
+        FileHost.shared.endAllLoadCwds()
+        FileHost.shared.endAllFromLibraryLoads()
         drainEmitBuffer()
     }
 
@@ -86,6 +239,12 @@ final class KernelBridge {
         DispatchQueue.main.async { [weak self] in
             self?.drainEmitBuffer()
         }
+    }
+
+    /// Clear the `\S` paste-stop flag (call before a new multi-line paste).
+    func clearReplBatchStop() {
+        replBatchStopRequested = false
+        _ = kernel_take_repl_batch_stop()
     }
 
     /// Evaluate one line of Forth. Returns when the line finishes.
@@ -105,6 +264,12 @@ final class KernelBridge {
         let sem = DispatchSemaphore(value: 0)
         forthQueue.async {
             defer {
+                FileHost.shared.releaseIncludeBuffers()
+                FileHost.shared.endAllLoadCwds()
+                FileHost.shared.endAllFromLibraryLoads()
+                if FileHost.shared.fromLibraryArmed {
+                    FileHost.shared.clearFromLibrary()
+                }
                 if Thread.isMainThread {
                     self.drainEmitBuffer()
                 } else {
@@ -119,6 +284,9 @@ final class KernelBridge {
             result = bytes.withUnsafeBufferPointer { buf in
                 kernel_eval(UnsafeRawPointer(buf.baseAddress!).assumingMemoryBound(to: CChar.self),
                             line.utf8.count)
+            }
+            if kernel_take_repl_batch_stop() != 0 {
+                self.replBatchStopRequested = true
             }
         }
 
@@ -143,6 +311,14 @@ final class KernelBridge {
     fileprivate func handleEmitBytes(_ buf: UnsafePointer<CChar>, count: Int) {
         emitLock.lock()
         pendingBytes.append(Data(bytes: buf, count: count))
+        emitLock.unlock()
+        scheduleEmitFlush()
+    }
+
+    fileprivate func handleEmitString(_ s: String) {
+        guard let data = s.data(using: .utf8) else { return }
+        emitLock.lock()
+        pendingBytes.append(data)
         emitLock.unlock()
         scheduleEmitFlush()
     }
