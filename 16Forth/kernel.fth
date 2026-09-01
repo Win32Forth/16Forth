@@ -124,6 +124,16 @@ DOC" DOT-QUOTE ( C: ccc -- ) compile print of string (immediate)"
 : ."
     STATE @ IF  POSTPONE S"  POSTPONE TYPE
     ELSE  34 PARSE TYPE  THEN  ; IMMEDIATE
+DOC" .( ( -- ) print text until ) immediately (immediate; Core Ext)"
+\ Skip leading spaces/tabs (ANS), then PARSE to ')' and TYPE.
+\ 41 = ASCII ')'. N: so this is never mex'd as a callee.
+\ Use >IN @ 1+ >IN ! — +! is defined later in this file.
+N: .(
+    BEGIN
+      SOURCE NIP >IN @ >
+      IF SOURCE DROP >IN @ + C@ DUP BL = SWAP 9 = OR ELSE FALSE THEN
+    WHILE >IN @ 1+ >IN ! REPEAT
+    41 PARSE TYPE ; IMMEDIATE
 
 \ --- Memory words
 DOC" CMOVE ( c-addr1 c-addr2 u -- ) copy u chars low→high"
@@ -323,6 +333,10 @@ DOC" (SEE-STEP) ( addr -- addr'|0 ) decompile one body cell"
     R@ SLIT-ADDR = IF
         R> DROP 8 + DUP @ >R 8 +
         83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE
+        R> + ALIGNED EXIT THEN
+    R@ CSTR-ADDR = IF
+        R> DROP 8 + DUP C@ >R 1+
+        67 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE
         R> + ALIGNED EXIT THEN
     R@ (SEE-BR?) IF
         R@ NAME>STRING TYPE SPACE R> DROP

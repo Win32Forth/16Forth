@@ -2,6 +2,8 @@
 
 **Version 0.5** — macOS SwiftUI console host for a small ARM64 Forth engine.
 
+**This is the last release that supports inlining** (`FL_INLINE`, `N:`, `D:`, `INLINE-ON` / `INLINE-OFF`, CODE paste / colon expand / native-convert). Tag `v0.5` freezes that model; **0.6** drops it to simplify the compiler. Source-only release — build the app from this tree yourself (no binary attached).
+
 16Forth is a Forth that starts from a compact set of CODE primitives and grows through `kernel.fth` / `ansfile.fth`. This repository is the **only active 16Forth line**: the GUI app (`16Forth.app`) with an embedded kernel and an optional headless **agent** channel. The former CLI twin **[16ForthCLI](https://github.com/Win32Forth/16ForthCLI) is archived and inactive** — do not expect further engine sync or releases there.
 
 Public domain / PickleForth lineage (same family as [64Forth](https://github.com/Win32Forth/64Forth)).
@@ -41,6 +43,7 @@ Nested colon expand is **safe**: `_macro_expand_colon` saves/restores the full m
 - **`RECURSE`** is CODE and goes through `_compile_word` (native-aware under `INLINE-ON`).
 - **`FILE-ECHO`**: line-oriented echo (64Forth-style) via block `_sys_write`; fixed mid-line truncation caused by `emit_hook` clobbering the echo end register; `ELAPSED` timings now follow the echoed `ELAPSED …` line instead of splicing into source.
 - Agent channel + `tools/16forth-agent` for automated loads (e.g. `~/Documents/Benchmarks`).
+- **`.(`** (interpret-time print to `)`), **`C"`** / **`(C")`** (counted string, 64Forth-style) ported for completeness before the inline cut.
 
 ### Benchmarks / what we found (Documents/Benchmarks, median of 3)
 

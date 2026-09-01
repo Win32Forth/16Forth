@@ -154,7 +154,9 @@ The console `.app` goal above is met. **16ForthCLI is archived and inactive**; t
 
 **Perf note (0.5):** Documents/Benchmarks show modest INLINE-ON gains vs true OFF; 64Forth still ahead on most suites. Likely larger lever than more colon expand: 64Forth TOS-in-register (`x20`) vs 16Forth memory TOS.
 
-Still deferred vs a full 64Forth-class IDE: `S"` inside expand/native convert, ARM disassembly of native JIT bodies, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
+**Release note:** `v0.5` is the **last tag that supports inlining**. Source-only GitHub release; no app binary. **0.6** removes the inline / native-convert machinery.
+
+Still deferred vs a full 64Forth-class IDE: ARM disassembly of native JIT bodies, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
 
 ## Status — v0.4 (historical)
 

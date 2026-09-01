@@ -151,6 +151,7 @@ cfa_exit:       .quad 0
 cfa_comma:      .quad 0
 cfa_does_rt:    .quad 0
 cfa_slit:       .quad 0
+cfa_cstr:       .quad 0
 cfa_branch:     .quad 0
 cfa_0branch:    .quad 0
 cfa_do:         .quad 0
@@ -170,6 +171,8 @@ pending_help_addr: .quad 0       // SETDOC / DOC" → next : / N: / CREATE
 pending_help_len:  .quad 0
 .align 3
 pending_help_buf:  .space 256    // NUL-terminated copy for _header_build
+.align 3
+cquote_pad:        .space 256    // interpret-mode C" counted string scratch
 source_id_var:  .quad 0          // 0=user/eval, -1=EVALUATE, 1=malloc INCLUDE, 2=host INCLUDE
 .equ SRC_MAX, 8
 .equ SRC_FRAME, 40               // addr,len,>IN,id,file_echo_pos
@@ -1540,6 +1543,100 @@ XSQUOTE:
     str  x3, [x2]
     NEXT
 
+// (C") ( -- c-addr ) runtime: counted string inline at IP (len byte + chars, pad 8)
+BOOT_WORD "(C\")", "(C\") ( -- c-addr ) runtime for C\"", 0, XCSTR
+XCSTR:
+    mov  x0, x19                // c-addr of counted string
+    ldrb w1, [x19]
+    add  x19, x19, x1
+    add  x19, x19, #1
+    add  x19, x19, #7
+    and  x19, x19, #-8
+    DPUSH x0
+    NEXT
+
+// C" ( -- c-addr ) IMMEDIATE — ANS counted string (from 64Forth)
+// Interpret: counted copy in cquote_pad. Compile: (C") + counted bytes + align.
+// Do not skip leading blanks (same rule as 64Forth C" / S").
+BOOT_WORD "C\"", "C\" ( -- c-addr ) \"-delimited counted string (immediate)", FL_IMM, XCQUOTE
+XCQUOTE:
+    adrp x0, source_addr@page
+    add  x0, x0, source_addr@pageoff
+    ldr  x9, [x0]
+    adrp x0, to_in@page
+    add  x0, x0, to_in@pageoff
+    mov  x10, x0
+    ldr  x11, [x10]
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    ldr  x12, [x0]
+    add  x1, x9, x11
+    add  x6, x9, x12
+    mov  x2, x1                 // c-addr (include leading spaces)
+_cq_scan:
+    cmp  x1, x6
+    b.hs _cq_eos
+    ldrb w3, [x1]
+    cbz  w3, _cq_eos
+    cmp  w3, #34
+    b.eq _cq_found
+    add  x1, x1, #1
+    b    _cq_scan
+_cq_found:
+    sub  x5, x1, x2
+    add  x1, x1, #1
+    b    _cq_commit
+_cq_eos:
+    sub  x5, x1, x2
+_cq_commit:
+    sub  x11, x1, x9
+    str  x11, [x10]
+    cmp  x5, #255
+    b.ls _cq_lenok
+    mov  x5, #255
+_cq_lenok:
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbnz x0, _cq_comp
+    // interpret → transient counted string
+    adrp x0, cquote_pad@page
+    add  x0, x0, cquote_pad@pageoff
+    strb w5, [x0]
+    mov  x3, #0
+1:  cmp  x3, x5
+    b.ge 2f
+    ldrb w4, [x2, x3]
+    add  x6, x0, #1
+    strb w4, [x6, x3]
+    add  x3, x3, #1
+    b    1b
+2:  DPUSH x0
+    NEXT
+_cq_comp:
+    stp  x2, x5, [sp, #-16]!
+    adrp x0, cfa_cstr@page
+    add  x0, x0, cfa_cstr@pageoff
+    ldr  x0, [x0]
+    bl   _compile_cell
+    ldp  x2, x5, [sp], #16
+    adrp x0, here_ptr@page
+    add  x0, x0, here_ptr@pageoff
+    ldr  x1, [x0]
+    strb w5, [x1], #1
+    mov  x3, #0
+3:  cmp  x3, x5
+    b.ge 4f
+    ldrb w4, [x2, x3]
+    strb w4, [x1, x3]
+    add  x3, x3, #1
+    b    3b
+4:  add  x1, x1, x5
+    add  x1, x1, #7
+    and  x1, x1, #-8
+    str  x1, [x0]
+    NEXT
+
 BOOT_WORD "BYE", "BYE ( -- ) exit process", 0, XBYE
 XBYE:
     mov  x0, #0
@@ -2498,6 +2595,14 @@ XSLIT_ADDR:
     DPUSH x0
     NEXT
 
+BOOT_WORD "CSTR-ADDR", "CSTR-ADDR ( -- xt ) xt of (C\") runtime (for SEE)", 0, XCSTR_ADDR
+XCSTR_ADDR:
+    adrp x0, cfa_cstr@page
+    add  x0, x0, cfa_cstr@pageoff
+    ldr  x0, [x0]
+    DPUSH x0
+    NEXT
+
 BOOT_WORD "DO-ADDR", "DO-ADDR ( -- xt ) xt of (DO) runtime (for SEE)", 0, XDO_ADDR
 XDO_ADDR:
     adrp x0, cfa_do@page
@@ -3015,7 +3120,14 @@ _colon_body_scan:
     b.ne 12f
     mov  x17, #1                     // (S")
     b    90f                         // can't reliably skip payload — fail both
-12: cmp  x2, x13
+12: adrp x3, cfa_cstr@page
+    add  x3, x3, cfa_cstr@pageoff
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.ne 13f
+    mov  x17, #1                     // (C") — same: not inline-safe
+    b    90f
+13: cmp  x2, x13
     b.eq 30f                         // LIT + value
     cmp  x2, x15
     b.eq 30f                         // BRANCH + off
@@ -4159,6 +4271,12 @@ _boot_cache:
     add  x0, x0, cnt_slit@pageoff
     adrp x1, cfa_slit@page
     add  x1, x1, cfa_slit@pageoff
+    bl   _cache_one
+
+    adrp x0, cnt_cstr@page
+    add  x0, x0, cnt_cstr@pageoff
+    adrp x1, cfa_cstr@page
+    add  x1, x1, cfa_cstr@pageoff
     bl   _cache_one
 
     adrp x0, cnt_branch@page
@@ -5663,6 +5781,8 @@ cnt_comma:      .byte 1, ','
 cnt_does:       .byte 7, '(','D','O','E','S','>',')'
 .align 3
 cnt_slit:       .byte 4, '(','S','"',')'
+.align 3
+cnt_cstr:       .byte 4, '(','C','"',')'
 .align 3
 cnt_branch:     .byte 6, 'B','R','A','N','C','H'
 .align 3
