@@ -272,13 +272,50 @@ DOC" (CONTEXT) ( -- wid ) first search-order wordlist, or FORTH"
 : (CONTEXT)  GET-ORDER ?DUP 0= IF FORTH-WORDLIST EXIT THEN
   BEGIN DUP 1 > WHILE SWAP DROP 1- REPEAT DROP ;
 
-DOC" WORDS ( -- ) list names in CONTEXT wordlist"
-: WORDS ( -- )
+DOC" (UPC) ( c -- c' ) uppercase ASCII letter"
+: (UPC)  DUP 97 < 0= OVER 122 > 0= AND IF 32 - THEN ;
+
+\ Optional WORDS filter (64Forth-style substring; case-insensitive)
+CREATE (WFILT) 64 ALLOT
+VARIABLE (WFILT-U)
+VARIABLE (WM-CA)
+VARIABLE (WM-U)
+VARIABLE (WM-I)
+VARIABLE (WM-OK)
+
+DOC" (WFILT!) ( c-addr u -- ) store uppercased filter (max 63)"
+: (WFILT!)
+  63 MIN DUP (WFILT-U) !
+  0 ?DO DUP I + C@ (UPC) (WFILT) I + C! LOOP DROP ;
+
+DOC" (WORDS-AT?) ( -- flag ) match filter at (WM-CA)+(WM-I)"
+: (WORDS-AT?)
+  -1 (WM-OK) !
+  (WFILT-U) @ 0 ?DO
+    (WM-CA) @ (WM-I) @ + I + C@ (UPC)
+    (WFILT) I + C@ <> IF 0 (WM-OK) ! LEAVE THEN
+  LOOP (WM-OK) @ ;
+
+DOC" (WORDS-MATCH?) ( xt -- flag ) true if name contains filter (or no filter)"
+: (WORDS-MATCH?)
+  (WFILT-U) @ 0= IF DROP TRUE EXIT THEN
+  >NAME COUNT (WM-U) ! (WM-CA) !
+  (WM-U) @ (WFILT-U) @ < IF FALSE EXIT THEN
+  (WM-U) @ (WFILT-U) @ - 1+ 0 ?DO
+    I (WM-I) !
+    (WORDS-AT?) IF TRUE UNLOOP EXIT THEN
+  LOOP FALSE ;
+
+DOC" WORDS ( ['filter'] -- ) list CONTEXT names; optional substring filter"
+: WORDS
+    BL WORD COUNT (WFILT!)
     0 >R
     (CONTEXT) @
     BEGIN DUP WHILE
-        DUP >NAME COUNT DUP R> + >R TYPE SPACE
-        R@ 60 > IF CR R> DROP 0 >R THEN
+        DUP (WORDS-MATCH?) IF
+            DUP >NAME COUNT DUP R> + >R TYPE SPACE
+            R@ 60 > IF CR R> DROP 0 >R THEN
+        THEN
         >LINK @
     REPEAT DROP R> DROP CR ;
 
