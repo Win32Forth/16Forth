@@ -188,6 +188,9 @@ final class KernelBridge {
     private var pendingBytes = Data()
     private var emitFlushScheduled = false
 
+    /// Agent / headless mode: deliver EMIT synchronously (no main-queue defer).
+    private var agentSyncEmit = false
+
     private init() {
         kernelHookTarget = self
         kernel_set_emit(kernelEmitTrampoline)
@@ -196,6 +199,19 @@ final class KernelBridge {
         FileHost.shared.onMessage = { [weak self] s in
             self?.handleEmitString(s)
         }
+    }
+
+    /// Enable synchronous emit delivery (agent CLI). Call before evaluate.
+    func setAgentSyncEmit(_ on: Bool) {
+        agentSyncEmit = on
+        if on {
+            forceFlushEmitSync()
+        }
+    }
+
+    /// Drain pending emit buffer to `onEmit` immediately on this thread.
+    func forceFlushEmitSync() {
+        drainEmitBuffer()
     }
 
     private func installFileHooks() {
@@ -233,11 +249,34 @@ final class KernelBridge {
         Int(kernel_data_depth())
     }
 
+    /// Alias used by the agent channel (matches 64Forth naming).
+    var dataStackDepth: Int { dataDepth }
+
+    /// True after a successful cold start.
+    var isKernelLive: Bool { started }
+
+    /// INCLUDE / FLOAD a file by path (absolute or relative to logical cwd).
+    @discardableResult
+    func loadFile(named name: String) -> Int32 {
+        let spec = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spec.isEmpty else {
+            return evaluate("FLOAD")
+        }
+        // Quote so paths with spaces round-trip through INCLUDE's parser.
+        let escaped = spec.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return evaluate("INCLUDE \"\(escaped)\"")
+    }
+
     /// Flush any bytes buffered before the UI sink was attached.
     func attachEmitSink(_ sink: @escaping (String) -> Void) {
         onEmit = sink
-        DispatchQueue.main.async { [weak self] in
-            self?.drainEmitBuffer()
+        if agentSyncEmit {
+            drainEmitBuffer()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.drainEmitBuffer()
+            }
         }
     }
 
@@ -270,7 +309,7 @@ final class KernelBridge {
                 if FileHost.shared.fromLibraryArmed {
                     FileHost.shared.clearFromLibrary()
                 }
-                if Thread.isMainThread {
+                if self.agentSyncEmit || Thread.isMainThread {
                     self.drainEmitBuffer()
                 } else {
                     DispatchQueue.main.sync { self.drainEmitBuffer() }
@@ -324,6 +363,10 @@ final class KernelBridge {
     }
 
     private func scheduleEmitFlush() {
+        if agentSyncEmit {
+            drainEmitBuffer()
+            return
+        }
         emitLock.lock()
         if emitFlushScheduled {
             emitLock.unlock()

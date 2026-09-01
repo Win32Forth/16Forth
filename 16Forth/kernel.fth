@@ -1,7 +1,7 @@
 \ High-level 16Forth — loaded after the 16 inner primitives and the
 \ assembly bootstrap compiler (: ; CREATE DOES> , HERE POSTPONE ...).
 \ This file is real Forth, not .ascii embedded in the assembler.
-\ PARSE / SETDOC are CODE; DOC" arms help for the next : / I: / CREATE.
+\ PARSE / SETDOC are CODE; DOC" arms help for the next : / N: / CREATE.
 
 : DOC"  34 PARSE SETDOC ;
 
@@ -10,23 +10,29 @@ CREATE PAD 256 ALLOT
 
 \ --- Stack helpers ----------------------------------------------------------
 DOC" NIP ( x1 x2 -- x2 ) drop NOS"
-I: NIP   SWAP DROP ;
+: NIP   SWAP DROP ;
 DOC" TUCK ( x1 x2 -- x2 x1 x2 ) copy TOS under NOS"
-I: TUCK  SWAP OVER ;
+: TUCK  SWAP OVER ;
 DOC" 2DUP ( x1 x2 -- x1 x2 x1 x2 ) duplicate pair"
-I: 2DUP  OVER OVER ;
+: 2DUP  OVER OVER ;
 DOC" 2DROP ( x1 x2 -- ) drop two cells"
-I: 2DROP DROP DROP ;
+: 2DROP DROP DROP ;
 DOC" ROT ( x1 x2 x3 -- x2 x3 x1 ) rotate top three"
 : ROT   >R SWAP R> SWAP ;
 DOC" 1+ ( n -- n+1 )"
-I: 1+    1 + ;
+: 1+    1 + ;
 DOC" 1- ( n -- n-1 )"
-I: 1-    1 - ;
+: 1-    1 - ;
 DOC" NEGATE ( n -- -n )"
-I: NEGATE  0 SWAP - ;
+: NEGATE  0 SWAP - ;
 DOC" 2SWAP ( x1 x2 x3 x4 -- x3 x4 x1 x2 ) swap cell pairs"
 : 2SWAP  ROT >R ROT R> ;
+DOC" 2>R ( x1 x2 -- ) ( R: -- x1 x2 ) move pair to return stack"
+: 2>R  SWAP >R >R ;
+DOC" 2R> ( -- x1 x2 ) ( R: x1 x2 -- ) restore pair from return stack"
+: 2R>  R> R> SWAP ;
+DOC" 2R@ ( -- x1 x2 ) ( R: x1 x2 -- x1 x2 ) copy pair from return stack"
+: 2R@  R> R> 2DUP >R >R SWAP ;
 
 \ --- CREATE-family ----------------------------------------------------------
 DOC" CONSTANT ( x 'name' -- ) create constant"
@@ -53,19 +59,19 @@ DOC" BL ( -- c ) space character"
 32 CONSTANT BL
 
 DOC" CELL+ ( a-addr -- a-addr' ) add one cell"
-I: CELL+ CELL + ;
+: CELL+ CELL + ;
 DOC" CELLS ( n1 -- n2 ) cells to address units"
-I: CELLS CELL * ;
+: CELLS CELL * ;
 
 \ --- Logic (built on CODE 0= 0< < AND INVERT) -------------------------------
 DOC" = ( n1 n2 -- flag ) equal"
-I: =    - 0= ;
+: =    - 0= ;
 DOC" <> ( n1 n2 -- flag ) not equal"
-I: <>   = INVERT ;
+: <>   = INVERT ;
 DOC" > ( n1 n2 -- flag ) greater than"
-I: >    SWAP < ;
+: >    SWAP < ;
 DOC" 0<> ( n -- flag ) not equal to zero"
-I: 0<>  0= INVERT ;
+: 0<>  0= INVERT ;
 
 \ --- Compile state ----------------------------------------------------------
 DOC" [ ( -- ) enter interpret state (immediate)"
@@ -76,28 +82,27 @@ DOC" LITERAL ( C: x -- ) ( -- x ) compile literal (immediate)"
 : LITERAL  POSTPONE LIT  ,  ; IMMEDIATE
 DOC" ['] ( C: 'name' -- ) ( -- xt ) compile xt of name (immediate)"
 : [']  '  POSTPONE LITERAL  ; IMMEDIATE
-DOC" RECURSE ( C: -- ) compile recursive call to current definition (immediate)"
-: RECURSE  LAST  ,  ; IMMEDIATE
+\ RECURSE is CODE (native-aware via _compile_word); do not redefine here.
 
 \ --- Control structures (BRANCH / 0BRANCH store relative offsets) -----------
-\ Compiled in asm (IF THEN ELSE BEGIN …). I: expander relocates BRANCH/0BRANCH.
+\ Compiled in asm (IF THEN ELSE BEGIN …). Expander relocates BRANCH/0BRANCH.
 
-\ I: ok — bodies compile to 0BRANCH/BRANCH cells; smart expander relocates them.
+\ Control-flow ok — bodies compile to 0BRANCH/BRANCH cells; expander relocates them.
 DOC" MIN ( n1 n2 -- n3 ) lesser of two"
-I: MIN  ( n1 n2 -- n3 )  2DUP < IF DROP ELSE NIP THEN ;
+: MIN  ( n1 n2 -- n3 )  2DUP < IF DROP ELSE NIP THEN ;
 DOC" MAX ( n1 n2 -- n3 ) greater of two"
-I: MAX  ( n1 n2 -- n3 )  2DUP < IF NIP ELSE DROP THEN ;
+: MAX  ( n1 n2 -- n3 )  2DUP < IF NIP ELSE DROP THEN ;
 
 DOC" ABS ( n -- u ) absolute value"
-I: ABS   DUP 0< IF NEGATE THEN ;
+: ABS   DUP 0< IF NEGATE THEN ;
 DOC" ?DUP ( x -- 0 | x x ) duplicate if nonzero"
-I: ?DUP  DUP IF DUP THEN ;
+: ?DUP  DUP IF DUP THEN ;
 
 \ --- Arithmetic extras ------------------------------------------------------
 DOC" /MOD ( n1 n2 -- rem quot )"
-I: /MOD  ( n1 n2 -- rem quot )  2DUP / DUP >R * - R> ;
+: /MOD  ( n1 n2 -- rem quot )  2DUP / DUP >R * - R> ;
 DOC" MOD ( n1 n2 -- n3 ) remainder"
-I: MOD   /MOD DROP ;
+: MOD   /MOD DROP ;
 
 \ DO/?DO/LOOP/+LOOP are asm immediates (native-aware under INLINE-ON).
 \ DO leaves ( 0 dest ); ?DO leaves ( orig dest ). Threaded offsets are relative.
@@ -176,15 +181,19 @@ DOC" D. ( n -- ) print signed via pictured output"
     DUP 0< IF NEGATE 0 <# #S 45 HOLD #> ELSE 0 <# #S #> THEN TYPE SPACE ;
 
 \ --- Inline enable/disable -------------------------------------------------
-\ Build/kernel stays INLINE-OFF (threaded, SEE-friendly).
-\ App workflow: develop with INLINE-OFF; later INLINE-ON and recompile so
-\ new : words are whole-word native. Marked I:/CODE leaves paste or macro-
-\ expand (nested I: ok); anything else is a native trampoline call.
-\ D: (asm) saves INLINE?, forces OFF for that definition, restores on ;.
-DOC" INLINE-ON ( -- ) new : words compile as native JIT"
+\ Bodies always compile threaded. At ; a safe body (single trailing EXIT,
+\ no RECURSE / S") gets FL_INLINE unless defined with N:.
+\ INLINE-ON: callers macro-expand FL_INLINE callees; unsafe/N: words are
+\ converted to whole-word native at ;. INLINE-OFF: no expand, no convert.
+\ D: saves INLINE?, forces OFF for that definition, restores on ;.
+DOC" INLINE-ON ( -- ) expand inlineable callees; native-convert the rest"
 : INLINE-ON   -1 INLINE? ! ;
-DOC" INLINE-OFF ( -- ) new : words stay threaded (SEE-friendly)"
+DOC" INLINE-OFF ( -- ) no macro-expand; leave : threaded (SEE-friendly)"
 : INLINE-OFF   0 INLINE? ! ;
+DOC" WARNINGS-ON ( -- ) warn when EXIT appears inside a definition"
+: WARNINGS-ON   -1 WARNINGS? ! ;
+DOC" WARNINGS-OFF ( -- ) silence EXIT-in-definition warnings"
+: WARNINGS-OFF   0 WARNINGS? ! ;
 
 \ --- Dictionary walking -----------------------------------------------------
 DOC" >LINK ( xt -- a-addr ) link field address"
@@ -205,6 +214,59 @@ DOC" >BODY ( xt -- a-addr ) parameter field (CFA+8)"
 : >BODY  8 + ;
 DOC" ALIGNED ( addr -- a-addr ) align upward to cell"
 : ALIGNED  7 + 7 INVERT AND ;
+DOC" ALIGN ( -- ) align HERE to cell boundary"
+: ALIGN  HERE ALIGNED HERE - ALLOT ;
+DOC" CHAR+ ( c-addr -- c-addr' ) add one character"
+: CHAR+  1+ ;
+DOC" 2@ ( addr -- x1 x2 ) fetch two cells (x2 from addr, x1 from addr+CELL)"
+: 2@  DUP CELL+ @ SWAP @ ;
+DOC" 2! ( x1 x2 addr -- ) store two cells (x2 at addr, x1 at addr+CELL)"
+: 2!  SWAP OVER ! CELL+ ! ;
+DOC" UNDER+ ( a x b -- a+b x ) add b under x"
+: UNDER+  ROT + SWAP ;
+DOC" FILL ( addr u b -- ) fill u bytes at addr with b"
+: FILL  >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ;
+DOC" ERASE ( addr u -- ) fill u bytes with zero"
+: ERASE  0 FILL ;
+VARIABLE (CMP-U1)
+VARIABLE (CMP-U2)
+DOC" COMPARE ( c-addr1 u1 c-addr2 u2 -- n ) string compare -1/0/1"
+: COMPARE  ( c-addr1 u1 c-addr2 u2 -- n )
+  (CMP-U2) ! >R (CMP-U1) ! >R      \ R: ca2 ca1
+  R> R>                            \ ca1 ca2
+  (CMP-U1) @ (CMP-U2) @ MIN 0 ?DO
+    OVER I + C@  OVER I + C@ -
+    ?DUP IF
+      NIP NIP
+      0< IF -1 ELSE 1 THEN
+      UNLOOP EXIT
+    THEN
+  LOOP
+  2DROP
+  (CMP-U1) @ (CMP-U2) @
+  2DUP = IF 2DROP 0 ELSE < IF -1 ELSE 1 THEN THEN ;
+DOC" [DEFINED] ( 'name' -- flag ) true if name is found (immediate)"
+: [DEFINED]  BL WORD FIND NIP 0<> ; IMMEDIATE
+DOC" [UNDEFINED] ( 'name' -- flag ) true if name is not found (immediate)"
+: [UNDEFINED]  BL WORD FIND NIP 0= ; IMMEDIATE
+DOC" [THEN] ( -- ) end of [IF] (immediate no-op)"
+: [THEN]  ; IMMEDIATE
+DOC" [ELSE] ( -- ) skip to matching [THEN] (immediate)"
+: [ELSE]
+  1 BEGIN
+    BEGIN BL WORD COUNT DUP WHILE
+      2DUP S" [IF]" COMPARE 0= IF 2DROP 1+
+      ELSE 2DUP S" [ELSE]" COMPARE 0= IF 2DROP 1- DUP IF 1+ THEN
+      ELSE 2DUP S" [THEN]" COMPARE 0= IF 2DROP 1- ELSE 2DROP THEN THEN THEN
+      DUP 0= IF DROP EXIT THEN
+    REPEAT 2DROP REFILL 0= UNTIL DROP ; IMMEDIATE
+DOC" [IF] ( flag -- ) interpret if true else skip to [ELSE]/[THEN] (immediate)"
+: [IF]  0= IF POSTPONE [ELSE] THEN ; IMMEDIATE
+DOC" ABORT-QUOTE ( flag -- ) if flag nonzero type message and ABORT (immediate)"
+: ABORT"  STATE @ IF
+    POSTPONE IF POSTPONE S" POSTPONE TYPE POSTPONE CR
+    POSTPONE ABORT POSTPONE THEN
+  ELSE 34 PARSE ROT IF TYPE CR ABORT THEN 2DROP THEN ; IMMEDIATE
 DOC" DOCOL? ( xt -- flag ) true if colon (CFA holds DOCOL)"
 : DOCOL?  @ DOCOL-ADDR = ;
 
@@ -235,11 +297,11 @@ DOC" (SEE-BR?) ( xt -- flag ) SEE: branch/loop runtime with offset cell?"
     R@ QDO-ADDR = OR
     R> DROP ;
 
-\ FFA bit 62 = I: macro (same as asm FFA_INLINE).
-DOC" (SEE-I?) ( xt -- flag ) true if I: macro bit set"
+\ FFA bit 62 = auto-inlineable colon (same as asm FFA_INLINE).
+DOC" (SEE-I?) ( xt -- flag ) true if inlineable (FL_INLINE) bit set"
 : (SEE-I?) ( xt -- flag )  >FLAGS @ 1 62 LSHIFT AND ;
 
-DOC" (SEE-HDR) ( xt -- xt ) print :/I:/CODE tag and help or name"
+DOC" (SEE-HDR) ( xt -- xt ) print :/I:/CODE tag (I if inlineable) and help or name"
 : (SEE-HDR) ( xt -- xt )
     DUP DOCOL? IF
         DUP (SEE-I?) IF 73 EMIT THEN

@@ -1,0 +1,56 @@
+#!/bin/sh
+# 16forth-agent — run 16Forth headless agent channel (load files, capture output).
+# Public domain.
+#
+# Usage:
+#   ./tools/16forth-agent -e '2 2 + .'
+#   ./tools/16forth-agent -c ~/Documents/Benchmarks -f sieve.fth -o /tmp/sieve.txt
+#   ./tools/16forth-agent --help
+#
+# Resolves the app binary from (first hit):
+#   FORTH16_APP          — path to 16Forth.app or the MacOS/16Forth binary
+#   /Applications/16Forth.app
+#   repo build/DerivedData Debug
+#   Xcode DerivedData Debug build (if present)
+
+set -e
+
+resolve_bin() {
+  if [ -n "${FORTH16_APP:-}" ]; then
+    if [ -x "${FORTH16_APP}" ] && [ ! -d "${FORTH16_APP}" ]; then
+      echo "${FORTH16_APP}"
+      return
+    fi
+    if [ -x "${FORTH16_APP}/Contents/MacOS/16Forth" ]; then
+      echo "${FORTH16_APP}/Contents/MacOS/16Forth"
+      return
+    fi
+  fi
+  if [ -x "/Applications/16Forth.app/Contents/MacOS/16Forth" ]; then
+    echo "/Applications/16Forth.app/Contents/MacOS/16Forth"
+    return
+  fi
+  root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+  for cand in \
+    "$root/build/DerivedData/Build/Products/Debug/16Forth.app/Contents/MacOS/16Forth" \
+    "$root/build/DerivedData/Build/Products/Release/16Forth.app/Contents/MacOS/16Forth" \
+    "$root/build/Build/Products/Debug/16Forth.app/Contents/MacOS/16Forth" \
+    "$root/build/16Forth.app/Contents/MacOS/16Forth"
+  do
+    if [ -x "$cand" ]; then
+      echo "$cand"
+      return
+    fi
+  done
+  dd=$(ls -d "$HOME/Library/Developer/Xcode/DerivedData"/16Forth-*/Build/Products/Debug/16Forth.app/Contents/MacOS/16Forth 2>/dev/null | head -1)
+  if [ -n "$dd" ] && [ -x "$dd" ]; then
+    echo "$dd"
+    return
+  fi
+  echo "16forth-agent: cannot find 16Forth binary. Set FORTH16_APP=…/16Forth.app" >&2
+  exit 127
+}
+
+BIN=$(resolve_bin)
+# Always pass --agent so env is not required; remaining args go through.
+exec "$BIN" --agent "$@"

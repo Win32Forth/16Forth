@@ -120,12 +120,14 @@
 .align 3
 data_stack:     .skip DSTACK_SIZE
 return_stack:   .skip RSTACK_SIZE
-user_dict:      .skip 1024*1024
+.equ USER_DICT_SIZE, 8*1024*1024   // 8 MiB — matrix benchmarks need ~1 MiB data
+user_dict:      .skip USER_DICT_SIZE
 input_buffer:   .skip 2048
 name_buf:       .skip 256
 
 .align 3
 here_ptr:       .quad user_dict
+noname_xt:      .quad 0            // :NONAME CFA; ; pushes then clears
 // FORTH-WORDLIST = &latest_var (DICT_THREADS head cells)
 latest_var:     .quad 0
                 .space (DICT_THREADS - 1) * 8
@@ -151,7 +153,6 @@ cfa_does_rt:    .quad 0
 cfa_slit:       .quad 0
 cfa_branch:     .quad 0
 cfa_0branch:    .quad 0
-cfa_paren_inline: .quad 0
 cfa_do:         .quad 0
 cfa_qdo:        .quad 0
 cfa_loop:       .quad 0
@@ -165,7 +166,7 @@ embed_c_sp:     .quad 0          // C SP after SAVE_C_CALLEE in kernel_eval (abo
 timeval_buf:    .quad 0, 0       // gettimeofday scratch (avoid SP timeval)
 timespec_buf:   .quad 0, 0       // nanosleep scratch
 ms_remain:      .quad 0          // MS remaining ms across nanosleep
-pending_help_addr: .quad 0       // SETDOC / DOC" → next : / I: / CREATE
+pending_help_addr: .quad 0       // SETDOC / DOC" → next : / N: / CREATE
 pending_help_len:  .quad 0
 .align 3
 pending_help_buf:  .space 256    // NUL-terminated copy for _header_build
@@ -200,18 +201,24 @@ end_include_hook:   .quad 0
 chdir_hook:         .quad 0
 pwd_hook:           .quad 0
 dir_hook:           .quad 0
-inline_var:         .quad 0      // 0 = threaded :,  -1 = native/inline :
-compiling_native:   .quad 0
-inline_region:      .quad 0      // -1 = mid-colon [INLINE]...[THREAD] fragment
+inline_var:         .quad 0      // 0 = no expand; -1 = expand inlineable + native-convert unsafe
+compiling_native:   .quad 0      // -1 while emitting whole-word native (convert at ;)
+warnings_var:       .quad 0      // -1 = warn when EXIT appears in a definition
+colon_no_inline:    .quad 0      // -1 = N: — never set FL_INLINE
 dcolon_flag:        .quad 0      // -1 = ;/ABORT should restore INLINE? from dcolon_saved
 dcolon_saved:       .quad 0      // INLINE? value saved by D:
-// I: macro expand: map source cell addr → output cursor; fixups for branches
+// Macro expand: map source cell addr → output cursor; fixups for branches.
+// Nested expand saves the full map/fix arrays (not only counts) on the C
+// stack so inner FILL→1+ expand cannot clobber the outer BRANCH reloc table.
 .equ MEX_MAP_MAX, 128
 .equ MEX_FIX_MAX, 64
+.equ MEX_MAP_BYTES, (MEX_MAP_MAX * 16)
+.equ MEX_FIX_BYTES, (MEX_FIX_MAX * 16)
+.equ MEX_SAVE_BYTES, (MEX_MAP_BYTES + MEX_FIX_BYTES)
 mex_map_n:          .quad 0
 mex_fix_n:          .quad 0
-mex_map:            .space MEX_MAP_MAX*16   // [old, new] …
-mex_fix:            .space MEX_FIX_MAX*16   // [patch, old_target] …
+mex_map:            .space MEX_MAP_BYTES    // [old, new] …
+mex_fix:            .space MEX_FIX_BYTES    // [patch, old_target] …
 emit_hook:          .quad 0      // void (*)(int c)
 emit_buf_hook:      .quad 0      // void (*)(const char *buf, size_t n)
 vm_dsp:             .quad 0      // saved DSP across C returns (embed host)
@@ -440,15 +447,16 @@ XIMMEDIATE:
 
 BOOT_WORD ":", ": ( \"name\" -- ) start colon definition", 0, XCOLON
 XCOLON:
-    mov  x20, #0                     // not I:
+    mov  x20, #0                     // allow auto FL_INLINE at ;
     b    _colon_common
 
-BOOT_WORD "I:", "I: ( \"name\" -- ) colon marked INLINE (macro)", 0, XICOLON
-XICOLON:
-    mov  x20, #1                     // set FL_INLINE on header
+// N: — like :, but never marked inlineable (opt-out for large / identity-sensitive words).
+BOOT_WORD "N:", "N: ( \"name\" -- ) colon that is never macro-expanded", 0, XNCOLON
+XNCOLON:
+    mov  x20, #1                     // colon_no_inline
     b    _colon_common
 
-// D: — define with INLINE temporarily off (threaded/debuggable), restore on ; / ABORT.
+// D: — define with INLINE temporarily off (no expand / no native-convert), restore on ; / ABORT.
 BOOT_WORD "D:", "D: ( \"name\" -- ) colon with INLINE off until ;", 0, XDCOLON
 XDCOLON:
     adrp x0, dcolon_flag@page
@@ -464,61 +472,63 @@ XDCOLON:
     str  xzr, [x1]                   // INLINE-OFF for this definition
     mov  x2, #-1
     str  x2, [x0]                    // pending restore
-1:  mov  x20, #0                     // not I: (plain DOCOL, SEE-friendly)
+1:  mov  x20, #0
     b    _colon_common
 
 _colon_common:
-    bl   _word
-    cbz  x0, _colon_fail
-    bl   _counted_to_cstr            // x0 = name cstr
-    mov  x3, x20                     // preserve I: flag (0/1)
-    bl   _take_pending_help          // x1 = help cstr (preserves x0, x3)
-    mov  x2, xzr
-    cbz  x3, 1f
-    mov  x2, #FL_INLINE              // I: → FFA inline bit (macro)
-1:  adrp x3, DOCOL@page
-    add  x3, x3, DOCOL@pageoff
-    bl   _header_build
-
-    adrp x0, inline_var@page
-    add  x0, x0, inline_var@pageoff
-    ldr  x0, [x0]
-    cbz  x0, 1f
-
-    // native colon: CFA points at JIT buffer, not user_dict
-    adrp x1, last_cfa@page
-    add  x1, x1, last_cfa@pageoff
-    ldr  x1, [x1]                    // address of CFA cell
-    adrp x2, code_here@page
-    add  x2, x2, code_here@pageoff
-    ldr  x3, [x2]                    // next free JIT byte
-    cbz  x3, _die                    // mmap failed
-    str  x3, [x1]                    // [CFA] = JIT code address
-
-    adrp x0, native_pro@page
-    add  x0, x0, native_pro@pageoff
-    adrp x1, native_pro_end@page
-    add  x1, x1, native_pro_end@pageoff
-    sub  x1, x1, x0
-    bl   _emit_bytes                 // copies prologue at code_here
-
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
+    // Named colon clears any pending :NONAME xt.
+    adrp x0, noname_xt@page
+    add  x0, x0, noname_xt@pageoff
+    str  xzr, [x0]
+    // N: → colon_no_inline; : / D: clear it.
+    adrp x0, colon_no_inline@page
+    add  x0, x0, colon_no_inline@pageoff
+    cbz  x20, 0f
     mov  x1, #-1
     str  x1, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
-    str  xzr, [x0]                  // whole-word native, not a region
-    b    2f
-
-1:  adrp x0, compiling_native@page
+    b    01f
+0:  str  xzr, [x0]
+01: bl   _word
+    cbz  x0, _colon_fail
+    bl   _counted_to_cstr            // x0 = name cstr
+    bl   _take_pending_help          // x1 = help cstr (preserves x0, x3)
+    mov  x2, xzr                     // never set FL_INLINE at create — ; decides
+    adrp x3, DOCOL@page
+    add  x3, x3, DOCOL@pageoff
+    bl   _header_build
+    // Always compile the body threaded; INLINE-ON may convert at ; if not inlineable.
+    adrp x0, compiling_native@page
     add  x0, x0, compiling_native@pageoff
     str  xzr, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
-    str  xzr, [x0]
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    mov  x1, #-1
+    str  x1, [x0]
+    NEXT
 
-2:  adrp x0, state_var@page
+// :NONAME — anonymous colon; ; leaves xt. Always threaded (POSTPONE-friendly).
+BOOT_WORD ":NONAME", ":NONAME ( C: -- ) ( -- xt ) start anonymous colon; ; leaves xt", 0, XNONAME
+XNONAME:
+    adrp x0, empty_name@page
+    add  x0, x0, empty_name@pageoff
+    bl   _take_pending_help          // x1 = help
+    mov  x2, #0
+    adrp x3, DOCOL@page
+    add  x3, x3, DOCOL@pageoff
+    bl   _header_build
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
+    ldr  x0, [x0]
+    adrp x1, noname_xt@page
+    add  x1, x1, noname_xt@pageoff
+    str  x0, [x1]
+    adrp x0, colon_no_inline@page
+    add  x0, x0, colon_no_inline@pageoff
+    str  xzr, [x0]
+    adrp x0, compiling_native@page
+    add  x0, x0, compiling_native@pageoff
+    str  xzr, [x0]
+    adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
     mov  x1, #-1
     str  x1, [x0]
@@ -526,30 +536,20 @@ _colon_common:
 
 BOOT_WORD ";", "; ( -- ) end colon definition", FL_IMM, XSEMI
 XSEMI:
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
-    ldr  x1, [x0]
-    str  xzr, [x0]
-    cbz  x1, 1f
-    adrp x0, native_epi@page
-    add  x0, x0, native_epi@pageoff
-    adrp x1, native_epi_end@page
-    add  x1, x1, native_epi_end@pageoff
-    sub  x1, x1, x0
-    bl   _emit_bytes
-    // Mid-colon region: also compile EXIT into the threaded wrapper.
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
-    ldr  x1, [x0]
-    str  xzr, [x0]
-    cbnz x1, 1f
-    b    2f
-1:  // compile EXIT xt
+    // Always plant trailing EXIT into the threaded body (no EXIT warning).
     adrp x0, cfa_exit@page
     add  x0, x0, cfa_exit@pageoff
     ldr  x0, [x0]
     bl   _compile_cell
-
+    adrp x0, compiling_native@page
+    add  x0, x0, compiling_native@pageoff
+    str  xzr, [x0]
+    // :NONAME: no auto-inline / native-convert
+    adrp x0, noname_xt@page
+    add  x0, x0, noname_xt@pageoff
+    ldr  x0, [x0]
+    cbnz x0, 2f
+    bl   _colon_finish_inline
 2:  // STATE = 0
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
@@ -566,16 +566,26 @@ XSEMI:
     adrp x0, inline_var@page
     add  x0, x0, inline_var@pageoff
     str  x1, [x0]
-3:  NEXT
-
-// INLINE? lives in asm; expose it:
-// add CODE words or:
-// If you only have the asm variable, add:
+3:  // :NONAME → leave xt
+    adrp x0, noname_xt@page
+    add  x0, x0, noname_xt@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 4f
+    str  xzr, [x0]
+    DPUSH x1
+4:  NEXT
 
 BOOT_WORD "INLINE?", "INLINE? ( -- addr )", 0, XINLINEQ
 XINLINEQ:
     adrp x0, inline_var@page
     add  x0, x0, inline_var@pageoff
+    DPUSH x0
+    NEXT
+
+BOOT_WORD "WARNINGS?", "WARNINGS? ( -- addr ) EXIT-in-definition warning flag", 0, XWARNINGSQ
+XWARNINGSQ:
+    adrp x0, warnings_var@page
+    add  x0, x0, warnings_var@pageoff
     DPUSH x0
     NEXT
 
@@ -1056,15 +1066,46 @@ XDOES_RT:
 1:  RPOP
     NEXT
 
+// RECURSE must go through _compile_word so INLINE-ON emits a native call,
+// not a threaded cell via "," into HERE.
+BOOT_WORD "RECURSE", "RECURSE ( C: -- ) compile call to word being defined", FL_IMM, XRECURSE
+XRECURSE:
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    bl   _compile_word
+1:  NEXT
+
 BOOT_WORD "POSTPONE", "POSTPONE ( \"name\" -- ) ANS postpone", FL_IMM, XPOSTPONE
 XPOSTPONE:
     bl   _word
     cbz  x0, _undef_current
     bl   _find
     cbz  x0, _undef_current
-    str  x0, [sp, #-16]!
+    stp  x0, x1, [sp, #-16]!         // xt, imm (1) / non-imm (-1)
+    adrp x2, compiling_native@page
+    add  x2, x2, compiling_native@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 10f
+
+    // Native: imm → call xt; non-imm → lit xt + call ,
+    ldp  x0, x1, [sp], #16
     cmp  x1, #1
-    b.eq 1f
+    b.eq 2f
+    bl   _emit_native_lit
+    adrp x0, cfa_comma@page
+    add  x0, x0, cfa_comma@pageoff
+    ldr  x0, [x0]
+    bl   _emit_native_call
+    NEXT
+2:  bl   _emit_native_call
+    NEXT
+
+10: // Threaded: imm → , xt; non-imm → LIT xt ,
+    ldp  x0, x1, [sp]
+    cmp  x1, #1
+    b.eq 11f
     adrp x0, cfa_lit@page
     add  x0, x0, cfa_lit@pageoff
     ldr  x0, [x0]
@@ -1077,7 +1118,7 @@ XPOSTPONE:
     bl   _compile_cell
     add  sp, sp, #16
     NEXT
-1:  ldr  x0, [sp], #16
+11: ldr  x0, [sp], #16
     bl   _compile_cell
     NEXT
 
@@ -1126,7 +1167,7 @@ XPARSE:
     DPUSH x7
     NEXT
 
-// SETDOC ( c-addr u -- ) pending help for next : / I: / CREATE (skip lead blanks)
+// SETDOC ( c-addr u -- ) pending help for next : / N: / CREATE (skip lead blanks)
 BOOT_WORD "SETDOC", "SETDOC ( c-addr u -- ) pending help for next defining word", 0, XSETDOC
 XSETDOC:
     DPOP x1                         // u
@@ -1498,87 +1539,6 @@ XSQUOTE:
     and  x3, x3, #-8
     str  x3, [x2]
     NEXT
-
-// (INLINE) — threaded runtime for a mid-colon native fragment.
-// Body layout: (INLINE) xt, abs-addr of JIT fragment (no native_pro; we RPUSH).
-BOOT_WORD "(INLINE)", "(INLINE) ( -- ) run following native fragment", 0, XPARENINLINE
-XPARENINLINE:
-    ldr  x0, [x19], #8
-    RPUSH
-    br   x0
-
-BOOT_WORD "[INLINE]", "[INLINE] ( -- ) native compile", FL_IMM, XBRACKETINLINE
-XBRACKETINLINE:
-    adrp x0, state_var@page
-    add  x0, x0, state_var@pageoff
-    ldr  x0, [x0]
-    cbz  x0, 1f
-    // Compiling: start a native fragment inside a threaded colon.
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
-    ldr  x0, [x0]
-    cbnz x0, 2f                     // already native — no-op
-    adrp x0, cfa_paren_inline@page
-    add  x0, x0, cfa_paren_inline@pageoff
-    ldr  x0, [x0]
-    bl   _compile_cell
-    adrp x1, code_here@page
-    add  x1, x1, code_here@pageoff
-    ldr  x0, [x1]
-    cbz  x0, _die
-    bl   _compile_cell              // absolute JIT entry address
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
-    mov  x1, #-1
-    str  x1, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
-    str  x1, [x0]
-    NEXT
-1:  // Interpret: next : is a whole-word native colon.
-    adrp x0, inline_var@page
-    add  x0, x0, inline_var@pageoff
-    mov  x1, #-1
-    str  x1, [x0]
-    NEXT
-2:  NEXT
-
-BOOT_WORD "[THREAD]", "[THREAD] ( -- ) threaded compile", FL_IMM, XBRACKETTHREAD
-XBRACKETTHREAD:
-    adrp x0, state_var@page
-    add  x0, x0, state_var@pageoff
-    ldr  x0, [x0]
-    cbz  x0, 1f
-    // Compiling: close mid-colon native fragment.
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
-    ldr  x1, [x0]
-    cbz  x1, 2f
-    adrp x2, inline_region@page
-    add  x2, x2, inline_region@pageoff
-    ldr  x3, [x2]
-    cbz  x3, 2f                     // whole-word native: ignore mid-body [THREAD]
-    str  xzr, [x0]                  // compiling_native = 0
-    str  xzr, [x2]                  // inline_region = 0
-    adrp x0, native_epi@page
-    add  x0, x0, native_epi@pageoff
-    adrp x1, native_epi_end@page
-    add  x1, x1, native_epi_end@pageoff
-    sub  x1, x1, x0
-    bl   _emit_bytes
-    NEXT
-1:  // Interpret: next : is threaded.
-    adrp x0, inline_var@page
-    add  x0, x0, inline_var@pageoff
-    str  xzr, [x0]
-    adrp x0, compiling_native@page
-    add  x0, x0, compiling_native@pageoff
-    str  xzr, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
-    str  xzr, [x0]
-    NEXT
-2:  NEXT
 
 BOOT_WORD "BYE", "BYE ( -- ) exit process", 0, XBYE
 XBYE:
@@ -2614,6 +2574,18 @@ XUMMOD:
     NEXT
 
 // MS@ ( -- u ) wall-clock ms since Unix epoch (gettimeofday)
+BOOT_WORD "UNUSED", "UNUSED ( -- u ) bytes remaining in dictionary", 0, XUNUSED
+XUNUSED:
+    adrp x0, here_ptr@page
+    add  x0, x0, here_ptr@pageoff
+    ldr  x0, [x0]
+    adrp x1, user_dict@page
+    add  x1, x1, user_dict@pageoff
+    add  x1, x1, #USER_DICT_SIZE
+    sub  x0, x1, x0
+    DPUSH x0
+    NEXT
+
 BOOT_WORD "MS@", "MS@ ( -- u ) wall-clock milliseconds since epoch", 0, XMSFETCH
 XMSFETCH:
     SAVE_C_CALLEE
@@ -2926,6 +2898,200 @@ _compile_cell:
     str  x2, [x1]
     ret
 
+// If WARNINGS? and compiling: "<name> uses EXIT - Not inlinable\n"
+// Independent of INLINE?. Uses last_cfa name (word being defined).
+_maybe_warn_exit:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    adrp x0, warnings_var@page
+    add  x0, x0, warnings_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    adrp x0, last_cfa@page
+    add  x0, x0, last_cfa@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    ldr  x1, [x0, #-8]              // FFA
+    and  x1, x1, #0xFFFF             // NFA offset
+    cbz  x1, 9f
+    sub  x19, x0, x1                 // NFA (counted)
+    ldrb w20, [x19], #1
+    cbz  w20, 1f
+    mov  x1, x19
+    mov  x2, x20
+    bl   _sys_write
+1:  adrp x1, str_exit_warn_mid@page
+    add  x1, x1, str_exit_warn_mid@pageoff
+    mov  x2, #str_exit_warn_mid_len
+    bl   _sys_write
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// After trailing EXIT: set/clear FL_INLINE; maybe native-convert.
+// FL_INLINE: safe shape (trailing EXIT only, no RECURSE, no S"), and not N:.
+// Native convert (INLINE-ON && !FL_INLINE): requires trailing-EXIT-only
+// (expander stops at first EXIT — early EXIT must stay threaded).
+_colon_finish_inline:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    adrp x0, colon_no_inline@page
+    add  x0, x0, colon_no_inline@pageoff
+    ldr  x19, [x0]                   // N? nonzero
+    str  xzr, [x0]
+    bl   _colon_body_scan            // x0=inlineable, x1=trailing_exit_ok
+    mov  x20, x1                     // save trailing_exit_ok
+    // clear or set FL_INLINE
+    adrp x2, last_cfa@page
+    add  x2, x2, last_cfa@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 9f
+    ldr  x3, [x2, #-8]
+    mov  x4, #(1 << 62)
+    bic  x3, x3, x4
+    cbnz x19, 1f                     // N: → never set
+    cbz  x0, 1f                      // not inlineable shape
+    orr  x3, x3, x4
+    str  x3, [x2, #-8]
+    b    9f                          // stay DOCOL + FL_INLINE
+1:  str  x3, [x2, #-8]               // cleared
+    // INLINE-ON && trailing EXIT only → whole-word native
+    adrp x0, inline_var@page
+    add  x0, x0, inline_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    cbz  x20, 9f                     // early EXIT / corrupt → stay threaded
+    bl   _colon_convert_native
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// Walk threaded body [last_cfa+8, HERE).
+// → x0 = 1 if FL_INLINE-safe (trailing EXIT, no self, no S")
+// → x1 = 1 if single trailing EXIT (native-convertible shape)
+_colon_body_scan:
+    mov  x0, #0
+    mov  x1, #0
+    adrp x2, last_cfa@page
+    add  x2, x2, last_cfa@pageoff
+    ldr  x9, [x2]                    // xt / self
+    cbz  x9, 90f
+    ldr  x2, [x9]
+    adrp x3, DOCOL@page
+    add  x3, x3, DOCOL@pageoff
+    cmp  x2, x3
+    b.ne 90f
+    adrp x2, here_ptr@page
+    add  x2, x2, here_ptr@pageoff
+    ldr  x10, [x2]                   // end
+    add  x11, x9, #8                 // p
+    mov  x16, #0                     // saw_self
+    mov  x17, #0                     // saw_slit
+    adrp x12, cfa_exit@page
+    add  x12, x12, cfa_exit@pageoff
+    ldr  x12, [x12]
+    adrp x13, cfa_lit@page
+    add  x13, x13, cfa_lit@pageoff
+    ldr  x13, [x13]
+    adrp x14, cfa_slit@page
+    add  x14, x14, cfa_slit@pageoff
+    ldr  x14, [x14]
+    adrp x15, cfa_branch@page
+    add  x15, x15, cfa_branch@pageoff
+    ldr  x15, [x15]
+10: cmp  x11, x10
+    b.hs 90f                         // ran off without EXIT
+    ldr  x2, [x11]
+    cmp  x2, x12
+    b.eq 20f                         // EXIT
+    cmp  x2, x9
+    b.ne 11f
+    mov  x16, #1                     // self / RECURSE
+11: cmp  x2, x14
+    b.ne 12f
+    mov  x17, #1                     // (S")
+    b    90f                         // can't reliably skip payload — fail both
+12: cmp  x2, x13
+    b.eq 30f                         // LIT + value
+    cmp  x2, x15
+    b.eq 30f                         // BRANCH + off
+    adrp x3, cfa_0branch@page
+    add  x3, x3, cfa_0branch@pageoff
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.eq 30f
+    adrp x3, cfa_qdo@page
+    add  x3, x3, cfa_qdo@pageoff
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.eq 30f
+    adrp x3, cfa_loop@page
+    add  x3, x3, cfa_loop@pageoff
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.eq 30f
+    adrp x3, cfa_plusloop@page
+    add  x3, x3, cfa_plusloop@pageoff
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.eq 30f
+    add  x11, x11, #8
+    b    10b
+30: add  x11, x11, #16
+    b    10b
+20: add  x2, x11, #8
+    cmp  x2, x10
+    b.ne 90f                         // early EXIT → neither flag
+    // Trailing EXIT only. RECURSE/self: not FL_INLINE and not native-convert
+    // for now (convert-before-expand leaves a fragile self-call).
+    cbnz x16, 90f
+    cbnz x17, 90f
+    mov  x1, #1                      // native-convertible
+    mov  x0, #1                      // FL_INLINE-safe
+90: ret
+
+// Convert last DOCOL body to whole-word native (INLINE-ON && !FL_INLINE).
+_colon_convert_native:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    adrp x19, last_cfa@page
+    add  x19, x19, last_cfa@pageoff
+    ldr  x19, [x19]
+    cbz  x19, 9f
+    adrp x0, code_here@page
+    add  x0, x0, code_here@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 9f
+    str  x1, [x19]                   // CFA → JIT entry
+    adrp x0, native_pro@page
+    add  x0, x0, native_pro@pageoff
+    adrp x1, native_pro_end@page
+    add  x1, x1, native_pro_end@pageoff
+    sub  x1, x1, x0
+    bl   _emit_bytes
+    adrp x0, compiling_native@page
+    add  x0, x0, compiling_native@pageoff
+    mov  x1, #-1
+    str  x1, [x0]
+    mov  x0, x19
+    bl   _macro_expand_colon
+    adrp x0, native_epi@page
+    add  x0, x0, native_epi@pageoff
+    adrp x1, native_epi_end@page
+    add  x1, x1, native_epi_end@pageoff
+    sub  x1, x1, x0
+    bl   _emit_bytes
+    adrp x0, compiling_native@page
+    add  x0, x0, compiling_native@pageoff
+    str  xzr, [x0]
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
 _cstrlen:
     mov  x1, x0
 0:  ldrb w2, [x1], #1
@@ -3087,10 +3253,16 @@ _set_source:
     str  xzr, [x2]
     ret
 
-// Echo INCLUDE source through current >IN when FILE-ECHO nonzero.
+// Echo INCLUDE source when FILE-ECHO nonzero.
+// Line-oriented (64Forth-style): before parsing the next word, write any
+// not-yet-echoed text through the end of the line that contains that word.
+// That prints `ELAPSED main` before ELAPSED runs (timing follows the line).
+// Uses _sys_write for the span — the old per-char _putchar loop left the
+// end limit in x1, which emit_hook clobbers, truncating mid-line.
 _file_echo_upto:
-    stp  x29, x30, [sp, #-32]!
+    stp  x29, x30, [sp, #-48]!
     stp  x19, x20, [sp, #16]
+    stp  x21, x22, [sp, #32]
     adrp x0, file_echo_var@page
     add  x0, x0, file_echo_var@pageoff
     ldr  x0, [x0]
@@ -3102,26 +3274,83 @@ _file_echo_upto:
     b.le 9f
     adrp x19, source_addr@page
     add  x19, x19, source_addr@pageoff
-    ldr  x19, [x19]
+    ldr  x19, [x19]                 // base
+    adrp x0, source_len@page
+    add  x0, x0, source_len@pageoff
+    ldr  x20, [x0]                   // len
+    // cursor = >IN (next parse position), clamped
+    adrp x0, to_in@page
+    add  x0, x0, to_in@pageoff
+    ldr  x0, [x0]
+    cmp  x0, x20
+    csel x0, x20, x0, hi
+    // skip whitespace to next token (or EOF)
+1:  cmp  x0, x20
+    b.hs 2f
+    ldrb w1, [x19, x0]
+    cbz  w1, 2f
+    cmp  w1, #32
+    b.eq 3f
+    cmp  w1, #9
+    b.eq 3f
+    cmp  w1, #10
+    b.eq 3f
+    cmp  w1, #13
+    b.eq 3f
+    b    2f
+3:  add  x0, x0, #1
+    b    1b
+2:  // x0 = token offset or EOF; find end of that line (CR/LF/NUL/EOF)
+    mov  x21, x0
+4:  cmp  x21, x20
+    b.hs 5f
+    ldrb w1, [x19, x21]
+    cbz  w1, 5f
+    cmp  w1, #10
+    b.eq 5f
+    cmp  w1, #13
+    b.eq 5f
+    add  x21, x21, #1
+    b    4b
+5:  // x21 = line_end offset; x22 = file_echo_pos
     adrp x0, file_echo_pos@page
     add  x0, x0, file_echo_pos@pageoff
-    ldr  x20, [x0]               // start
-    adrp x1, to_in@page
-    add  x1, x1, to_in@pageoff
-    ldr  x1, [x1]                // end = >IN
-    cmp  x20, x1
-    b.hs 9f
-1:  cmp  x20, x1
-    b.hs 2f
-    ldrb w0, [x19, x20]
+    ldr  x22, [x0]
+    cmp  x22, x20
+    csel x22, x20, x22, hi
+    cmp  x22, x21
+    b.hs 9f                          // already echoed this line
+    // write [base+pos, base+line_end)
+    add  x1, x19, x22                // buf
+    sub  x2, x21, x22                // len
+    cbz  x2, 6f
+    bl   _sys_write
+6:  // Advance past CR/LF/CRLF before putchar (emit clobbers x0-x18).
+    mov  x0, x21                     // next pos candidate
+    cmp  x21, x20
+    b.hs 8f
+    ldrb w1, [x19, x21]
+    cmp  w1, #10
+    b.eq 7f
+    cmp  w1, #13
+    b.ne 8f
+    add  x0, x21, #1
+    cmp  x0, x20
+    b.hs 8f
+    ldrb w1, [x19, x0]
+    cmp  w1, #10
+    b.ne 8f
+    add  x0, x0, #1
+    b    8f
+7:  add  x0, x21, #1
+8:  adrp x1, file_echo_pos@page
+    add  x1, x1, file_echo_pos@pageoff
+    str  x0, [x1]
+    mov  x0, #10
     bl   _putchar
-    add  x20, x20, #1
-    b    1b
-2:  adrp x0, file_echo_pos@page
-    add  x0, x0, file_echo_pos@pageoff
-    str  x20, [x0]
-9:  ldp  x19, x20, [sp, #16]
-    ldp  x29, x30, [sp], #32
+9:  ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #48
     ret
 
 // _push_source: save addr,len,>IN,id,echo_pos. x0=1 ok, 0=overflow.
@@ -3944,12 +4173,6 @@ _boot_cache:
     add  x1, x1, cfa_0branch@pageoff
     bl   _cache_one
 
-    adrp x0, cnt_paren_inline@page
-    add  x0, x0, cnt_paren_inline@pageoff
-    adrp x1, cfa_paren_inline@page
-    add  x1, x1, cfa_paren_inline@pageoff
-    bl   _cache_one
-
     adrp x0, cnt_do@page
     add  x0, x0, cnt_do@pageoff
     adrp x1, cfa_do@page
@@ -4144,8 +4367,8 @@ _abort:
     adrp x0, compiling_native@page
     add  x0, x0, compiling_native@pageoff
     str  xzr, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
+    adrp x0, colon_no_inline@page
+    add  x0, x0, colon_no_inline@pageoff
     str  xzr, [x0]
     // If D: was open, restore prior INLINE?; else leave INLINE? alone.
     adrp x0, dcolon_flag@page
@@ -4187,8 +4410,8 @@ _do_quit:
     adrp x0, compiling_native@page
     add  x0, x0, compiling_native@pageoff
     str  xzr, [x0]
-    adrp x0, inline_region@page
-    add  x0, x0, inline_region@pageoff
+    adrp x0, colon_no_inline@page
+    add  x0, x0, colon_no_inline@pageoff
     str  xzr, [x0]
     adrp x0, dcolon_flag@page
     add  x0, x0, dcolon_flag@pageoff
@@ -4380,15 +4603,22 @@ _emit_native_lit:
 
 // ============================================================================
 // xt in x0.
-// Native: INLINE CODE → paste body; INLINE colon (I:) → macro-expand;
-//         else emit a call back into the ITC engine.
-// Threaded: INLINE colon → macro-expand; else ,
+// Native (convert-at-;): FL_INLINE CODE → paste; FL_INLINE DOCOL → expand;
+//         else trampoline call.
+// Threaded: if INLINE? && FL_INLINE DOCOL → macro-expand; else ,
+// EXIT compiled here may warn (WARNINGS?); ; plants EXIT via _compile_cell.
 // ============================================================================
 _compile_word:                   // x0 = xt
     stp  x29, x30, [sp, #-32]!
     stp  x19, x20, [sp, #16]
     mov  x19, x0                 // save xt
-    adrp x1, compiling_native@page
+    adrp x1, cfa_exit@page
+    add  x1, x1, cfa_exit@pageoff
+    ldr  x1, [x1]
+    cmp  x19, x1
+    b.ne 5f
+    bl   _maybe_warn_exit
+5:  adrp x1, compiling_native@page
     add  x1, x1, compiling_native@pageoff
     ldr  x1, [x1]
     cbz  x1, 20f                 // threaded
@@ -4402,7 +4632,7 @@ _compile_word:                   // x0 = xt
     ldr  x0, [x19]
     bl   _emit_bytes
     b    30f
-12: // INLINE colon (I:)? macro-expand if DOCOL
+12: // FL_INLINE colon? macro-expand if DOCOL (nested-safe via map save)
     ldr  x0, [x19]
     adrp x1, DOCOL@page
     add  x1, x1, DOCOL@pageoff
@@ -4416,6 +4646,10 @@ _compile_word:                   // x0 = xt
     b    30f
 
 20: // ---- threaded ----
+    adrp x1, inline_var@page
+    add  x1, x1, inline_var@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 25f                 // INLINE-OFF: never expand
     ldr  x2, [x19, #-8]
     tbz  x2, #62, 25f
     ldr  x0, [x19]
@@ -4433,7 +4667,7 @@ _compile_word:                   // x0 = xt
     ret
 
 // ---------------------------------------------------------------------------
-// I: macro expand helpers (relative BRANCH/0BRANCH reloc)
+// Macro expand helpers (relative BRANCH/0BRANCH reloc)
 // ---------------------------------------------------------------------------
 // Output cursor: HERE (threaded) or code_here (native)
 _mex_cursor:                         // → x0
@@ -4544,6 +4778,15 @@ _mex_resolve:
     ldp  x19, x20, [sp, #16]
     ldp  x29, x30, [sp], #48
     ret
+
+// Copy n [quad,quad] entries: x0=n, x1=src, x2=dst (clobbers x0-x4).
+_mex_copy_entries:
+    cbz  x0, 9f
+1:  ldp  x3, x4, [x1], #16
+    stp  x3, x4, [x2], #16
+    subs x0, x0, #1
+    b.ne 1b
+9:  ret
 
 // Native (?DO): pop index/limit; if equal b to old_target; else RPUSH.
 // x0 = old_target (skip past loop)
@@ -4831,12 +5074,18 @@ _mex_emit_native_plusloop:
     ldp  x29, x30, [sp], #128
     ret
 
-// Expand I:/INLINE colon body (xt in x0). Nested-safe.
+// Expand FL_INLINE colon body (xt in x0). Stops at first EXIT.
+// Nested-safe: copies map[]/fix[] to this frame before clearing counts.
 _macro_expand_colon:
-    stp  x29, x30, [sp, #-64]!
+    // Frame: [0..63] locals, [64 .. 64+MAP) saved map, then saved fix
+    mov  x1, #(64 + MEX_SAVE_BYTES)
+    sub  sp, sp, x1
+    stp  x29, x30, [sp]
+    mov  x29, sp
     stp  x19, x20, [sp, #16]
-    stp  x21, xzr, [sp, #32]
-    // save & clear map counts (nested expansions)
+    stp  x21, x22, [sp, #32]
+    mov  x19, x0                     // xt
+    // save counts
     adrp x1, mex_map_n@page
     add  x1, x1, mex_map_n@pageoff
     adrp x2, mex_fix_n@page
@@ -4844,10 +5093,26 @@ _macro_expand_colon:
     ldr  x3, [x1]
     ldr  x4, [x2]
     stp  x3, x4, [sp, #48]
+    // copy live map/fix entries into this frame
+    mov  x0, x3                      // map_n
+    adrp x1, mex_map@page
+    add  x1, x1, mex_map@pageoff
+    add  x2, sp, #64                 // dest map save
+    bl   _mex_copy_entries
+    ldr  x0, [sp, #56]               // fix_n
+    adrp x1, mex_fix@page
+    add  x1, x1, mex_fix@pageoff
+    add  x2, sp, #(64 + MEX_MAP_BYTES)
+    bl   _mex_copy_entries
+    // clear working tables for this nest level
+    adrp x1, mex_map_n@page
+    add  x1, x1, mex_map_n@pageoff
+    adrp x2, mex_fix_n@page
+    add  x2, x2, mex_fix_n@pageoff
     str  xzr, [x1]
     str  xzr, [x2]
 
-    add  x20, x0, #8                 // body pointer
+    add  x20, x19, #8                // body pointer
 1:  mov  x0, x20
     bl   _mex_note
     ldr  x19, [x20], #8
@@ -5006,7 +5271,17 @@ _macro_expand_colon:
     b    1b
 
 8:  bl   _mex_resolve
-    // restore outer counts
+    // restore outer map/fix arrays, then counts
+    ldr  x0, [sp, #48]               // saved map_n
+    add  x1, sp, #64
+    adrp x2, mex_map@page
+    add  x2, x2, mex_map@pageoff
+    bl   _mex_copy_entries
+    ldr  x0, [sp, #56]               // saved fix_n
+    add  x1, sp, #(64 + MEX_MAP_BYTES)
+    adrp x2, mex_fix@page
+    add  x2, x2, mex_fix@pageoff
+    bl   _mex_copy_entries
     adrp x1, mex_map_n@page
     add  x1, x1, mex_map_n@pageoff
     adrp x2, mex_fix_n@page
@@ -5014,9 +5289,11 @@ _macro_expand_colon:
     ldp  x3, x4, [sp, #48]
     str  x3, [x1]
     str  x4, [x2]
-    ldp  x21, xzr, [sp, #32]
+    ldp  x21, x22, [sp, #32]
     ldp  x19, x20, [sp, #16]
-    ldp  x29, x30, [sp], #64
+    ldp  x29, x30, [sp]
+    mov  x1, #(64 + MEX_SAVE_BYTES)
+    add  sp, sp, x1
     ret
 
 // Emit movz/movk sequence loading imm64 in x0 into register rd (x1 = rd 0..31)
@@ -5112,7 +5389,7 @@ native_epi:
     br   x1
 native_epi_end:
 
-// Pasted by I: expander for native (DO)
+// Pasted by macro expander for native (DO)
 native_do_setup:
     ldr  x1, [x22], #8           // index
     ldr  x0, [x22], #8           // limit
@@ -5314,11 +5591,13 @@ forth_source_end:
 .section __TEXT,__const
 .align 3
 banner:
-    .ascii "16Forth 0.4 ready\n"
+    .ascii "16Forth 0.5 ready\n"
 .equ banner_len, . - banner
 
 .align 3
 empty_help:
+    .byte 0
+empty_name:
     .byte 0
 
 .align 3
@@ -5345,11 +5624,9 @@ str_over:
     .quad 16
     .ascii " stack overflow\n"
 .align 3
-str_noinline:
-    .quad 17
-    .ascii " cannot inline: "
-str_noinline_nl:
-    .ascii "\n"
+str_exit_warn_mid:
+    .ascii " uses EXIT - Not inlinable\n"
+.equ str_exit_warn_mid_len, . - str_exit_warn_mid
 
 .align 3
 str_cant_open:
@@ -5391,7 +5668,6 @@ cnt_branch:     .byte 6, 'B','R','A','N','C','H'
 .align 3
 cnt_0branch:    .byte 7, '0','B','R','A','N','C','H'
 .align 3
-cnt_paren_inline: .byte 8, '(','I','N','L','I','N','E',')'
 cnt_do:         .byte 4, '(','D','O',')'
 cnt_qdo:        .byte 5, '(','?','D','O',')'
 cnt_loop:       .byte 6, '(','L','O','O','P',')'

@@ -33,13 +33,13 @@ Out of scope for v1 (unless you expand later): SZ-EDITOR, facility terminal, DEB
 
 ---
 
-## Current state
+## Current state (updated for v0.5)
 
 | Project | Path | Status |
 |---------|------|--------|
-| **16ForthCLI** | `XCodeProjects/16ForthCLI/` | Working CLI: full `kernel.s` (~2.1k), host C (io/file/jit), schemes, `build/16ForthCLI` |
-| **16Forth** | `XCodeProjects/16Forth/` | Unusable: Hello World SwiftUI + stale early `kernel.s` (~625) / incomplete `kernel.fth`; no bridge, no console, no host C |
-| **64Forth** | `XCodeProjects/64Forth/` | Reference for console UI + `KernelBridge` emit/eval pattern |
+| **16Forth** | `XCodeProjects/16Forth/` | **Active** — macOS `.app` + agent channel; marketing **0.5** |
+| **16ForthCLI** | `XCodeProjects/16ForthCLI/` / GitHub | **Archived / inactive** — no further sync expected |
+| **64Forth** | `XCodeProjects/64Forth/` | Reference for console UI + TOS-in-register kernel |
 
 ---
 
@@ -127,29 +127,35 @@ Skip for v1: `FacilityTerminal`, `ForthApplication` principal class, FileAccess/
 ## Definition of done
 
 - Double-clickable `16Forth.app` with its own console window.
-- Same language surface as 16ForthCLI for interactive Core + file words that do not need a TTY.
+- Same language surface historically shared with 16ForthCLI (now archived) for interactive Core + file words that do not need a TTY.
 - `kernel.fth` / `ansfile.fth` unchanged; `kernel.s` only changed for emit-hook + embed API surface.
 - No dependency on Terminal.app for REPL I/O.
 
 ---
 
-## Status — v0.4 (shipped beyond original v1 plan)
+## Status — v0.5 (current)
 
-The console `.app` goal above is met. Engine work after the first green app includes:
+The console `.app` goal above is met. **16ForthCLI is archived and inactive**; this repo is the sole active 16Forth line.
 
 | Area | Notes |
 |------|--------|
 | Embed `QUIT` / `ABORT` | Return to host under `embed_mode` (no readline hang). |
-| `[INLINE]` / `[THREAD]` / `INLINE-ON` / `D:` | Whole-word native JIT; `D:` saves/restores `INLINE?`. |
-| `I:` macros | Nested expand; LIT + relative `BRANCH`/`0BRANCH` reloc. |
+| Auto-inline / `N:` / `INLINE-ON`/`OFF` / `D:` / `WARNINGS` | Bodies always threaded; `FL_INLINE` at `;` if safe && !`N:`; ON expands inlineable + native-converts eligible rest; OFF expands nothing; EXIT warning independent of INLINE?. Removed user-facing `I:` / `[INLINE]` / `[THREAD]`. |
+| Nested mex | Full map/fixup save-restore so recursive colon expand is safe (`FILL`→`1+` no longer yields `BRANCH 0`). |
+| CODE paste | `inline_len_tab` unchanged role; `BRANCH`/`0BRANCH` not paste-inlined (expander reloc). |
 | Control immediates | Asm native-aware `IF`…`THEN`, `BEGIN`…, `DO`/`?DO`/`LOOP`/`+LOOP`. |
-| Loop indices | `I` / `J` / `K`; inlinable so native loops are correct. |
-| Startup | Banner **16Forth 0.4 ready**; app marketing version **0.4**. |
-| `SEE` / `HELP` | 64Forth-style ITC decompiler: colon walk until `EXIT`; `LIT`, `(S")`, `BRANCH`/`0BRANCH`, `(?DO)`/`(LOOP)`/`(+LOOP)` offsets; `(DO)` name-only; CODE/native → `(primitive)`; `I:` tag when FFA inline. |
+| Loop indices | `I` / `J` / `K`; `FL_INLINE` so native loops paste them. |
+| Startup | Banner **16Forth 0.5 ready**; app marketing version **0.5**. |
+| `SEE` / `HELP` | ITC decompiler; leading `I` when `FL_INLINE` set. |
 | Timing | `MS@` / `MS`; pictured `<# # #S #>` / `BASE`/`DECIMAL`/`HEX`; `ELAPSED` / `.ELAPSED`. |
-| INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/`. |
-| Vocabularies | ANS Search-Order + 64Forth extras: `VOCABULARY`, `ORDER`, `WORDLIST`, `TRAVERSE-WORDLIST`, `.VOCABULARIES`; starters `EDITOR`/`ASSEMBLER`/`FP`/`BIG-INTEGER`. |
+| INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, line-oriented `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/`. |
+| Vocabularies | ANS Search-Order + 64Forth extras (as in 0.4). |
+| Agent | `--agent` / `tools/16forth-agent`. |
 
-Still deferred vs a full 64Forth-class IDE: `S"` inside `I:`/native expand, ARM disassembly of native JIT bodies, shared engine tree with 16ForthCLI, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon.
+**Perf note (0.5):** Documents/Benchmarks show modest INLINE-ON gains vs true OFF; 64Forth still ahead on most suites. Likely larger lever than more colon expand: 64Forth TOS-in-register (`x20`) vs 16Forth memory TOS.
 
-Original note that `kernel.fth` would stay unchanged is historical — high-level words now use `I:` where useful, and DO-family immediates live in asm.
+Still deferred vs a full 64Forth-class IDE: `S"` inside expand/native convert, ARM disassembly of native JIT bodies, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
+
+## Status — v0.4 (historical)
+
+Vocabularies / Search-Order; INCLUDE/FileHost; agent channel; user-facing `I:` / `[INLINE]`/`[THREAD]`; banner **16Forth 0.4 ready**.

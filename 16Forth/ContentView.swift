@@ -8,7 +8,6 @@
 import SwiftUI
 import AppKit
 
-@main
 struct SixteenForthApp: App {
     var body: some Scene {
         WindowGroup("16Forth") {
