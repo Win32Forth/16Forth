@@ -258,7 +258,6 @@ XFETCH:
     ldr  x0, [x22]
     ldr  x0, [x0]
     str  x0, [x22]
-XFETCH_END:
     NEXT
 
 BOOT_WORD "!", "! ( n a -- )", 0, XSTORE
@@ -266,7 +265,6 @@ XSTORE:
     DPOP x1                     // a
     DPOP x0                     // n
     str  x0, [x1]
-XSTORE_END:
     NEXT
 
 BOOT_WORD "+", "+ ( n1 n2 -- n3 )", 0, XPLUS
@@ -275,7 +273,6 @@ XPLUS:
     ldr  x1, [x22]              // n1
     add  x1, x1, x0
     str  x1, [x22]
-XPLUS_END:
     NEXT
 
 BOOT_WORD "-", "- ( n1 n2 -- n3 )", 0, XMINUS
@@ -284,7 +281,6 @@ XMINUS:
     ldr  x1, [x22]              // n1
     sub  x1, x1, x0
     str  x1, [x22]
-XMINUS_END:
     NEXT
 
 BOOT_WORD "*", "* ( n1 n2 -- n3 )", 0, XMUL
@@ -293,7 +289,6 @@ XMUL:
     ldr  x1, [x22]
     mul  x1, x1, x0
     str  x1, [x22]
-XMUL_END:
     NEXT
 
 BOOT_WORD "/", "/ ( n1 n2 -- n3 )", 0, XDIV
@@ -302,20 +297,17 @@ XDIV:
     ldr  x1, [x22]
     sdiv x1, x1, x0
     str  x1, [x22]
-XDIV_END:
     NEXT
 
 BOOT_WORD "DUP", "DUP ( n -- n n )", 0, XDUP
 XDUP:
     ldr  x0, [x22]
     DPUSH x0
-XDUP_END:
     NEXT
 
 BOOT_WORD "DROP", "DROP ( n -- )", 0, XDROP
 XDROP:
     DPOP x0
-XDROP_END:
     NEXT
 
 BOOT_WORD "SWAP", "SWAP ( n1 n2 -- n2 n1 )", 0, XSWAP
@@ -324,14 +316,12 @@ XSWAP:
     ldr  x1, [x22, #8]
     str  x1, [x22]
     str  x0, [x22, #8]
-XSWAP_END:
     NEXT
 
 BOOT_WORD "OVER", "OVER ( n1 n2 -- n1 n2 n1 )", 0, XOVER
 XOVER:
     ldr  x0, [x22, #8]
     DPUSH x0
-XOVER_END:
     NEXT
 
 BOOT_WORD "EMIT", "EMIT ( c -- )", 0, XEMIT
@@ -901,7 +891,6 @@ XCFETCH:
     ldr  x0, [x22]
     ldrb w0, [x0]
     str  x0, [x22]
-XCFETCH_END:
     NEXT
 
 BOOT_WORD "C!", "C! ( c a -- )", 0, XCSTORE
@@ -909,7 +898,6 @@ XCSTORE:
     DPOP x1                     // a
     DPOP x0                     // c
     strb w0, [x1]
-XCSTORE_END:
     NEXT
 
 BOOT_WORD "AND", "AND ( n1 n2 -- n3 )", 0, XAND
@@ -918,7 +906,6 @@ XAND:
     ldr  x1, [x22]
     and  x1, x1, x0
     str  x1, [x22]
-XAND_END:
     NEXT
 
 BOOT_WORD "OR", "OR ( n1 n2 -- n3 )", 0, XORR
@@ -927,7 +914,6 @@ XORR:
     ldr  x1, [x22]
     orr  x1, x1, x0
     str  x1, [x22]
-XORR_END:
     NEXT
 
 BOOT_WORD "XOR", "XOR ( n1 n2 -- n3 )", 0, XXOR
@@ -936,7 +922,6 @@ XXOR:
     ldr  x1, [x22]
     eor  x1, x1, x0
     str  x1, [x22]
-XXOR_END:
     NEXT
 
 BOOT_WORD "INVERT", "INVERT ( n -- n' )", 0, XINVERT
@@ -944,7 +929,6 @@ XINVERT:
     ldr  x0, [x22]
     mvn  x0, x0
     str  x0, [x22]
-XINVERT_END:
     NEXT
 
 BOOT_WORD "0=", "0= ( n -- f )", 0, XZEQ
@@ -953,7 +937,6 @@ XZEQ:
     cmp  x0, #0
     csetm x0, eq
     str  x0, [x22]
-XZEQ_END:
     NEXT
 
 BOOT_WORD "0<", "0< ( n -- f )", 0, XZLT
@@ -962,7 +945,6 @@ XZLT:
     cmp  x0, #0
     csetm x0, lt
     str  x0, [x22]
-XZLT_END:
     NEXT
 
 BOOT_WORD "<", "< ( n1 n2 -- f )", 0, XLT
@@ -972,28 +954,24 @@ XLT:
     cmp  x1, x0
     csetm x1, lt
     str  x1, [x22]
-XLT_END:
     NEXT
 
 BOOT_WORD ">R", ">R ( n -- )", 0, XTOR
 XTOR:
     DPOP x0
     str  x0, [x23, #-8]!
-XTOR_END:
     NEXT
 
 BOOT_WORD "R>", "R> ( -- n )", 0, XRFROM
 XRFROM:
     ldr  x0, [x23], #8
     DPUSH x0
-XRFROM_END:
     NEXT
 
 BOOT_WORD "R@", "R@ ( -- n )", 0, XRAT
 XRAT:
     ldr  x0, [x23]
     DPUSH x0
-XRAT_END:
     NEXT
 
 
@@ -1093,34 +1071,29 @@ _pl_done:
 XI:
     ldr  x0, [x23]
     DPUSH x0
-XI_END:
     NEXT
 
     BOOT_WORD "J", "J ( -- n ) outer DO loop index (for nested loops)", 0, XJ
 XJ:
     ldr  x0, [x23, #16]            // skip inner index+limit
     DPUSH x0
-XJ_END:
     NEXT
 
     BOOT_WORD "K", "K ( -- n ) third DO loop index", 0, XK
 XK:
     ldr  x0, [x23, #32]            // skip two index+limit pairs
     DPUSH x0
-XK_END:
     NEXT
 
     BOOT_WORD "UNLOOP", "UNLOOP ( -- ) discard current DO loop params from rstack", 0, XUNLOOP
 XUNLOOP:
     add  x23, x23, #16
-XUNLOOP_END:
     NEXT
 
     BOOT_WORD "LEAVE", "LEAVE ( -- ) exit current DO loop (branch to after LOOP)", 0, XLEAVE
 XLEAVE:
     ldr  x0, [x23, #8]             // limit
     str  x0, [x23]                 // index = limit
-XLEAVE_END:
     NEXT
 
 
@@ -2184,7 +2157,6 @@ XLSHIFT:
     DPOP x0                     // n
     lsl  x0, x0, x1
     DPUSH x0
-XLSHIFT_END:
     NEXT
 
 BOOT_WORD "RSHIFT", "RSHIFT ( n u -- n' ) logical right shift", 0, XRSHIFT
@@ -2193,7 +2165,6 @@ XRSHIFT:
     DPOP x0                     // n
     lsr  x0, x0, x1
     DPUSH x0
-XRSHIFT_END:
     NEXT
 
 // SEE helpers: push cached xts / DOCOL code address (avoid awkward names in .fth)
