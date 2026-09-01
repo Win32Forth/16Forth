@@ -202,6 +202,10 @@ DOC" NAME>STRING ( xt -- c-addr u ) name as string"
 : NAME>STRING  NFA COUNT ;
 DOC" HFA ( xt -- hfa ) help field address"
 : HFA    DUP >FLAGS @ 16 RSHIFT 65535 AND - ;
+DOC" VIEW-LINE ( xt -- u ) 1-based source line in FLAGS (0=none)"
+: VIEW-LINE  >FLAGS @ 32 RSHIFT 65535 AND ;
+DOC" VIEW-FILE# ( xt -- u ) source file-id in FLAGS (0=none)"
+: VIEW-FILE#  >FLAGS @ 48 RSHIFT 32767 AND ;
 DOC" >HELP ( xt -- hfa ) help counted string"
 : >HELP  HFA ;
 DOC" >BODY ( xt -- a-addr ) parameter field (CFA+8)"
@@ -298,6 +302,28 @@ DOC" (SEE-HDR) ( xt -- xt ) print :/CODE tag and help or name"
     ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN
     DUP >HELP COUNT DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR ;
 
+VARIABLE VIEW-LEAF-A
+VARIABLE VIEW-LEAF-U
+DOC" (VIEW-BASENAME) leaf after last /"
+: (VIEW-BASENAME)
+    DUP 0= IF EXIT THEN
+    OVER VIEW-LEAF-A ! DUP VIEW-LEAF-U ! 2DROP
+    VIEW-LEAF-U @
+    BEGIN 1- DUP 0< 0= WHILE
+        VIEW-LEAF-A @ OVER + C@ 47 = IF
+            1+ DUP VIEW-LEAF-A @ +
+            SWAP VIEW-LEAF-U @ SWAP -
+            EXIT
+        THEN
+    REPEAT
+    DROP VIEW-LEAF-A @ VIEW-LEAF-U @ ;
+
+DOC" (SEE-WHERE) ( xt -- ) print leaf:line when VIEW known"
+: (SEE-WHERE)
+    DUP VIEW-FILE# ?DUP 0= IF DROP EXIT THEN
+    VIEW-PATH DUP 0= IF 2DROP DROP EXIT THEN
+    (VIEW-BASENAME) TYPE 58 EMIT VIEW-LINE . CR ;
+
 DOC" (SEE-PRIM) ( xt -- ) print (primitive) for non-colon"
 : (SEE-PRIM) ( xt -- )
     DROP
@@ -326,12 +352,16 @@ DOC" (SEE-STEP) ( addr -- addr'|0 ) decompile one body cell"
 \ for one DROP. Do not DUP before (SEE-HDR) — that was the 64Forth stack leak.
 DOC" SEE ( 'name' -- ) show help and decompile word"
 : SEE ( "name" -- )
-    ' (SEE-HDR)
+    ' (SEE-HDR) DUP (SEE-WHERE)
     DUP DOCOL? IF
         >BODY BEGIN (SEE-STEP) DUP 0= UNTIL DROP
     ELSE
         (SEE-PRIM)
     THEN ;
+
+DOC" LOCATE ( 'name' -- ) print source leaf:line"
+: LOCATE
+    ' DUP VIEW-FILE# 0= IF DROP S" no source location" TYPE CR ELSE (SEE-WHERE) THEN ;
 
 DOC" HELP ( 'name' -- ) synonym of SEE"
 : HELP  SEE ;
@@ -397,6 +427,7 @@ DOC" .WORDLISTS ( -- ) synonym of .VOCABULARIES"
 DOC" U< ( u1 u2 -- flag ) unsigned less than"
 : U<  ( u1 u2 -- flag )
     2DUP XOR 0< IF SWAP DROP 0< ELSE - 0< THEN ;
+
 DOC" WITHIN ( n1 n2 n3 -- flag ) true if n2 <= n1 < n3 (unsigned wrap)"
 : WITHIN  ( n1 n2 n3 -- flag )  OVER - >R - R> U< ;
 
