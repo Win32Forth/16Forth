@@ -17,7 +17,7 @@ extension Notification.Name {
     static let clearConsole = Notification.Name("SixteenForthClearConsole")
 }
 
-private let banner = "=== 16Forth 0.5 ===\n"
+private let banner = "=== 16Forth 0.6 ===\n"
 
 struct ConsoleView: View {
     @State private var consoleText = banner

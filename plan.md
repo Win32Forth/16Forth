@@ -33,11 +33,11 @@ Out of scope for v1 (unless you expand later): SZ-EDITOR, facility terminal, DEB
 
 ---
 
-## Current state (updated for v0.5)
+## Current state (updated for v0.6)
 
 | Project | Path | Status |
 |---------|------|--------|
-| **16Forth** | `XCodeProjects/16Forth/` | **Active** — macOS `.app` + agent channel; marketing **0.5** |
+| **16Forth** | `XCodeProjects/16Forth/` | **Active** — macOS `.app` + agent channel; marketing **0.6** (always-threaded; no inlining) |
 | **16ForthCLI** | `XCodeProjects/16ForthCLI/` / GitHub | **Archived / inactive** — no further sync expected |
 | **64Forth** | `XCodeProjects/64Forth/` | Reference for console UI + TOS-in-register kernel |
 
@@ -133,30 +133,30 @@ Skip for v1: `FacilityTerminal`, `ForthApplication` principal class, FileAccess/
 
 ---
 
-## Status — v0.5 (current)
+## Status — v0.6 (current)
 
 The console `.app` goal above is met. **16ForthCLI is archived and inactive**; this repo is the sole active 16Forth line.
 
 | Area | Notes |
 |------|--------|
 | Embed `QUIT` / `ABORT` | Return to host under `embed_mode` (no readline hang). |
-| Auto-inline / `N:` / `INLINE-ON`/`OFF` / `D:` / `WARNINGS` | Bodies always threaded; `FL_INLINE` at `;` if safe && !`N:`; ON expands inlineable + native-converts eligible rest; OFF expands nothing; EXIT warning independent of INLINE?. Removed user-facing `I:` / `[INLINE]` / `[THREAD]`. |
-| Nested mex | Full map/fixup save-restore so recursive colon expand is safe (`FILL`→`1+` no longer yields `BRANCH 0`). |
-| CODE paste | `inline_len_tab` unchanged role; `BRANCH`/`0BRANCH` not paste-inlined (expander reloc). |
-| Control immediates | Asm native-aware `IF`…`THEN`, `BEGIN`…, `DO`/`?DO`/`LOOP`/`+LOOP`. |
-| Loop indices | `I` / `J` / `K`; `FL_INLINE` so native loops paste them. |
-| Startup | Banner **16Forth 0.5 ready**; app marketing version **0.5**. |
-| `SEE` / `HELP` | ITC decompiler; leading `I` when `FL_INLINE` set. |
+| Compiler | **Always-threaded ITC only.** Removed: `FL_INLINE`, `N:`, `D:`, `INLINE-ON`/`OFF`, mex, CODE paste, native-convert, EXIT inlinability warnings, JIT code buffer (`host_jit`). |
+| Control immediates | Asm `IF`…`THEN`, `BEGIN`…, `DO`/`?DO`/`LOOP`/`+LOOP` — threaded cells only. |
+| Loop indices | `I` / `J` / `K` as ordinary CODE. |
+| Startup | Banner **16Forth 0.6 ready**; app marketing version **0.6**. |
+| `SEE` / `HELP` | ITC decompiler; no leading `I`. |
 | Timing | `MS@` / `MS`; pictured `<# # #S #>` / `BASE`/`DECIMAL`/`HEX`; `ELAPSED` / `.ELAPSED`. |
-| INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, line-oriented `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/`. |
+| INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, line-oriented `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/` → Resources. |
 | Vocabularies | ANS Search-Order + 64Forth extras (as in 0.4). |
 | Agent | `--agent` / `tools/16forth-agent`. |
 
-**Perf note (0.5):** Documents/Benchmarks show modest INLINE-ON gains vs true OFF; 64Forth still ahead on most suites. Likely larger lever than more colon expand: 64Forth TOS-in-register (`x20`) vs 16Forth memory TOS.
+**Perf note:** Next serious lever vs 64Forth is TOS-in-register (`x20`), not more compiler expand.
 
-**Release note:** `v0.5` is the **last tag that supports inlining**. Source-only GitHub release; no app binary. **0.6** removes the inline / native-convert machinery.
+Still deferred vs a full 64Forth-class IDE: Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
 
-Still deferred vs a full 64Forth-class IDE: ARM disassembly of native JIT bodies, Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
+## Status — v0.5 (historical)
+
+**Last release with inlining** — tag `v0.5`, source-only GitHub release. Auto-inline / `N:` / `D:` / `INLINE-ON`/`OFF` / mex / CODE paste / native-convert; nested mex; FILE-ECHO; agent; `.(` / `C"`. Banner **16Forth 0.5 ready**.
 
 ## Status — v0.4 (historical)
 

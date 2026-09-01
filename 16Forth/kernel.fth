@@ -1,7 +1,7 @@
 \ High-level 16Forth — loaded after the 16 inner primitives and the
 \ assembly bootstrap compiler (: ; CREATE DOES> , HERE POSTPONE ...).
 \ This file is real Forth, not .ascii embedded in the assembler.
-\ PARSE / SETDOC are CODE; DOC" arms help for the next : / N: / CREATE.
+\ PARSE / SETDOC are CODE; DOC" arms help for the next : / CREATE.
 
 : DOC"  34 PARSE SETDOC ;
 
@@ -82,12 +82,11 @@ DOC" LITERAL ( C: x -- ) ( -- x ) compile literal (immediate)"
 : LITERAL  POSTPONE LIT  ,  ; IMMEDIATE
 DOC" ['] ( C: 'name' -- ) ( -- xt ) compile xt of name (immediate)"
 : [']  '  POSTPONE LITERAL  ; IMMEDIATE
-\ RECURSE is CODE (native-aware via _compile_word); do not redefine here.
+\ RECURSE is CODE (via _compile_word); do not redefine here.
 
 \ --- Control structures (BRANCH / 0BRANCH store relative offsets) -----------
-\ Compiled in asm (IF THEN ELSE BEGIN …). Expander relocates BRANCH/0BRANCH.
+\ Compiled in asm (IF THEN ELSE BEGIN …). Bodies compile to 0BRANCH/BRANCH cells.
 
-\ Control-flow ok — bodies compile to 0BRANCH/BRANCH cells; expander relocates them.
 DOC" MIN ( n1 n2 -- n3 ) lesser of two"
 : MIN  ( n1 n2 -- n3 )  2DUP < IF DROP ELSE NIP THEN ;
 DOC" MAX ( n1 n2 -- n3 ) greater of two"
@@ -104,8 +103,8 @@ DOC" /MOD ( n1 n2 -- rem quot )"
 DOC" MOD ( n1 n2 -- n3 ) remainder"
 : MOD   /MOD DROP ;
 
-\ DO/?DO/LOOP/+LOOP are asm immediates (native-aware under INLINE-ON).
-\ DO leaves ( 0 dest ); ?DO leaves ( orig dest ). Threaded offsets are relative.
+\ DO/?DO/LOOP/+LOOP are asm immediates (threaded).
+\ DO leaves ( 0 dest ); ?DO leaves ( orig dest ). Offsets are relative.
 
 \ --- I/O --------------------------------------------------------------------
 DOC" CR ( -- ) emit newline"
@@ -126,9 +125,9 @@ DOC" DOT-QUOTE ( C: ccc -- ) compile print of string (immediate)"
     ELSE  34 PARSE TYPE  THEN  ; IMMEDIATE
 DOC" .( ( -- ) print text until ) immediately (immediate; Core Ext)"
 \ Skip leading spaces/tabs (ANS), then PARSE to ')' and TYPE.
-\ 41 = ASCII ')'. N: so this is never mex'd as a callee.
+\ 41 = ASCII ')'.
 \ Use >IN @ 1+ >IN ! — +! is defined later in this file.
-N: .(
+: .(
     BEGIN
       SOURCE NIP >IN @ >
       IF SOURCE DROP >IN @ + C@ DUP BL = SWAP 9 = OR ELSE FALSE THEN
@@ -189,21 +188,6 @@ DOC" UD. ( ud -- ) print unsigned double"
 DOC" D. ( n -- ) print signed via pictured output"
 : D.   ( n -- )
     DUP 0< IF NEGATE 0 <# #S 45 HOLD #> ELSE 0 <# #S #> THEN TYPE SPACE ;
-
-\ --- Inline enable/disable -------------------------------------------------
-\ Bodies always compile threaded. At ; a safe body (single trailing EXIT,
-\ no RECURSE / S") gets FL_INLINE unless defined with N:.
-\ INLINE-ON: callers macro-expand FL_INLINE callees; unsafe/N: words are
-\ converted to whole-word native at ;. INLINE-OFF: no expand, no convert.
-\ D: saves INLINE?, forces OFF for that definition, restores on ;.
-DOC" INLINE-ON ( -- ) expand inlineable callees; native-convert the rest"
-: INLINE-ON   -1 INLINE? ! ;
-DOC" INLINE-OFF ( -- ) no macro-expand; leave : threaded (SEE-friendly)"
-: INLINE-OFF   0 INLINE? ! ;
-DOC" WARNINGS-ON ( -- ) warn when EXIT appears inside a definition"
-: WARNINGS-ON   -1 WARNINGS? ! ;
-DOC" WARNINGS-OFF ( -- ) silence EXIT-in-definition warnings"
-: WARNINGS-OFF   0 WARNINGS? ! ;
 
 \ --- Dictionary walking -----------------------------------------------------
 DOC" >LINK ( xt -- a-addr ) link field address"
@@ -297,7 +281,7 @@ DOC" WORDS ( -- ) list names in CONTEXT wordlist"
 \ --- SEE (ITC decompiler; 64Forth-style, plus DO/?DO offsets) ----------------
 \ Colon bodies: walk xt cells until EXIT. Special inline payloads:
 \   LIT value | (S") len bytes | BRANCH/0BRANCH/(?DO)/(LOOP)/(+LOOP) offset
-\ (DO) has no trailing cell. CODE / native JIT: header + (primitive).
+\ (DO) has no trailing cell. CODE: header + (primitive).
 
 DOC" (SEE-BR?) ( xt -- flag ) SEE: branch/loop runtime with offset cell?"
 : (SEE-BR?) ( xt -- flag )
@@ -307,14 +291,9 @@ DOC" (SEE-BR?) ( xt -- flag ) SEE: branch/loop runtime with offset cell?"
     R@ QDO-ADDR = OR
     R> DROP ;
 
-\ FFA bit 62 = auto-inlineable colon (same as asm FFA_INLINE).
-DOC" (SEE-I?) ( xt -- flag ) true if inlineable (FL_INLINE) bit set"
-: (SEE-I?) ( xt -- flag )  >FLAGS @ 1 62 LSHIFT AND ;
-
-DOC" (SEE-HDR) ( xt -- xt ) print :/I:/CODE tag (I if inlineable) and help or name"
+DOC" (SEE-HDR) ( xt -- xt ) print :/CODE tag and help or name"
 : (SEE-HDR) ( xt -- xt )
     DUP DOCOL? IF
-        DUP (SEE-I?) IF 73 EMIT THEN
         58 EMIT SPACE
     ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN
     DUP >HELP COUNT DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR ;
@@ -448,12 +427,9 @@ DOC" DUMP ( addr u -- ) hex dump u bytes from addr (16 per line, ASCII gutter)"
 
 \\ Don't want to load smoke tests for now
 
-\ --- Smoke tests (left INLINE-OFF so the image boots debuggable) ------------
+\ --- Smoke tests ------------------------------------------------------------
 : SQUARE  DUP * ;
 : TEST    5 SQUARE . CR ;
-
-\ After load, user may:  INLINE-ON  and redefine app words for speed.
-\ Or wrap a single threaded definition:  D: DEBUGGY ... ;
 
 \ S" hi" TYPE CR
 \ TEST

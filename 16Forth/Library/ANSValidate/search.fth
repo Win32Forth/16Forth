@@ -1,0 +1,110 @@
+\ search.fth — ANS Search-Order spot-checks from TZForth ANS-VALIDATE / FTEST
+\
+\ Requires: tester.fth already loaded
+\ Loaded by ANS-VALIDATE.fth via relative FLOAD
+\
+\ (SWL) is SEARCH-WORDLIST — one wordlist probe without SET-ORDER thrashing.
+\
+\ CRITICAL: no interpret-time IF/BEGIN/WHILE.
+\
+\ NOT a formal ANS certificate. Prefer Hayes searchordertest.fth.
+
+DECIMAL
+ONLY FORTH DEFINITIONS
+
+CR .( === Search-Order ===) CR
+
+\ --- (SWL) helper ---
+: (SWL)  ( c-addr u wid -- 0 | xt 1 | xt -1 )
+SEARCH-WORDLIST ;
+
+\ --- ENVIRONMENT? ---
+S" SEARCH-ORDER" ENVIRONMENT? NIP S" ENV-SO" EXPECT
+S" WORDLISTS" ENVIRONMENT? DROP 8 = S" ENV-WLS" EXPECT
+
+\ --- FORTH-WORDLIST / GET-CURRENT ---
+FORTH-WORDLIST GET-CURRENT = S" GET-CURRENT" EXPECT
+
+\ --- empty WORDLIST ---
+WORDLIST CONSTANT SW-WL1
+S" DUP" SW-WL1 (SWL) 0= S" SWL-empty" EXPECT
+
+\ --- hit / immediate / miss ---
+\ hit leaves xt flag; turn flag into EXPECT flag, then drop xt
+S" DUP" FORTH-WORDLIST (SWL)
+0= 0= S" SWL-DUP" EXPECT
+
+S" IF" FORTH-WORDLIST (SWL)
+1 = S" SWL-IF" EXPECT
+
+S" NOSUCHWORDXYZ" FORTH-WORDLIST (SWL)
+0= S" SWL-miss" EXPECT
+
+\ --- ONLY → n=1 ---
+\ GET-ORDER: wid 1 → after 1= : wid flag ; EXPECT leaves wid
+ONLY
+GET-ORDER 1 = S" ONLY-n" EXPECT
+
+\ --- ONLY ALSO FORTH → n=2 ---
+\ GET-ORDER: wid2 wid1 2 → after 2= : wid2 wid1 flag
+ONLY ALSO FORTH
+GET-ORDER 2 = S" ALSO-n" EXPECT
+
+ONLY ALSO FORTH
+1 2 + 3 = S" ALSO-search" EXPECT
+
+\ --- SET-ORDER round-trip ---
+ONLY
+GET-ORDER SET-ORDER
+GET-ORDER 1 = S" SET-ORDER" EXPECT
+
+\ --- VOCABULARY isolate ---
+VOCABULARY SW-FOO
+SW-FOO DEFINITIONS
+123 CONSTANT SW-BAZ
+FORTH DEFINITIONS
+ONLY FORTH
+S" SW-BAZ" FORTH-WORDLIST (SWL) 0= S" VOCAB-isolate" EXPECT
+
+456 CONSTANT SW-OK
+SW-OK 456 = S" VOCAB-forth" EXPECT
+
+ONLY ALSO FORTH ALSO SW-FOO
+SW-BAZ 123 = S" VOCAB-lookup" EXPECT
+ONLY FORTH
+
+\ --- DEFINITIONS ---
+SW-FOO DEFINITIONS
+FORTH DEFINITIONS
+GET-CURRENT FORTH-WORDLIST = S" DEF-FORTH" EXPECT
+
+\ --- PREVIOUS ---
+\ ONLY FORTH ALSO → n=2; SW-FOO (PUSH-ORDER) → n=3; PREVIOUS → n=2
+ONLY FORTH ALSO SW-FOO
+PREVIOUS
+GET-ORDER 2 = S" PREVIOUS" EXPECT
+ONLY FORTH
+
+\ --- ALSO arithmetic ---
+ONLY ALSO FORTH
+10 20 + 30 = S" ALSO-arith" EXPECT
+ONLY FORTH
+
+\ --- ORDER does not crash ---
+ONLY ALSO FORTH
+ORDER
+TRUE S" ORDER" EXPECT
+ONLY FORTH
+
+\ --- WORDLIST + SET-CURRENT ---
+WORDLIST CONSTANT SW-WL2
+GET-CURRENT SW-WL2 SET-CURRENT
+789 CONSTANT SW-IN-WL2
+FORTH-WORDLIST SET-CURRENT
+ONLY FORTH
+S" SW-IN-WL2" FORTH-WORDLIST (SWL) 0= S" WL-isolate" EXPECT
+S" SW-IN-WL2" SW-WL2 (SWL)
+0= 0= S" WL-find" EXPECT
+ONLY FORTH
+
+.( --- Search-Order batch done ---) .STACK-DEPTH CR

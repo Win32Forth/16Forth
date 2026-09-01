@@ -2,7 +2,7 @@
 
 **Public domain.** Headless control so tools (Grok, CI, scripts) can load Forth files and capture console output without driving the GUI.
 
-**Status:** shipped with 16Forth 0.4; current app is **0.5** (rebuild in Xcode if your installed binary is older).
+**Status:** shipped with 16Forth 0.4; current app is **0.6** (rebuild in Xcode if your installed binary is older).
 
 ## Why
 

@@ -1,14 +1,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "host_jit.h"
 
 void forth_io_init(void)
 {
     setvbuf(stdin,  NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    forth_codebuf_init();
 }
 
 /* UM/MOD helper: unsigned 128-bit dividend / 64-bit divisor → rem, quot. */
