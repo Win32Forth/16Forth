@@ -436,7 +436,8 @@ _colon_common:
     add  x0, x0, noname_xt@pageoff
     str  xzr, [x0]
     bl   _word
-    cbz  x0, _colon_fail
+    ldrb w1, [x0]
+    cbz  w1, _colon_fail             // empty name at EOL
     bl   _counted_to_cstr            // x0 = name cstr
     bl   _take_pending_help          // x1 = help cstr (preserves x0, x3)
     mov  x2, xzr                     // flags (no FL_IMM)
@@ -700,7 +701,8 @@ XPLUSLOOP:
 BOOT_WORD "CREATE", "CREATE ( \"name\" -- ) header + DOVAR", 0, XCREATE, 692
 XCREATE:
     bl   _word
-    cbz  x0, _colon_fail
+    ldrb w1, [x0]
+    cbz  w1, _colon_fail             // empty name at EOL
     bl   _counted_to_cstr            // x0 = name cstr
     bl   _take_pending_help          // x1 = help cstr
     mov  x2, #0
@@ -747,7 +749,8 @@ XRECURSE:
 BOOT_WORD "POSTPONE", "POSTPONE ( \"name\" -- ) ANS postpone", FL_IMM, XPOSTPONE, 739
 XPOSTPONE:
     bl   _word
-    cbz  x0, _undef_current
+    ldrb w1, [x0]
+    cbz  w1, _undef_current          // empty name at EOL
     bl   _find
     cbz  x0, _undef_current
     stp  x0, x1, [sp, #-16]!         // xt, imm (1) / non-imm (-1)
@@ -774,7 +777,8 @@ XPOSTPONE:
 BOOT_WORD "'", "' ( \"name\" -- xt )", 0, XTICK, 766
 XTICK:
     bl   _word
-    cbz  x0, _undef_current
+    ldrb w1, [x0]
+    cbz  w1, _undef_current          // empty name at EOL
     bl   _find
     cbz  x0, _undef_current
     DPUSH x0
@@ -3454,9 +3458,14 @@ copy:
 empty_token:
     mov  x0, x9
     ret
+// ANS WORD: always a counted string at HERE; EOL → length 0 (never null).
 end_of_source:
     str  x4, [x3]
-    mov  x0, #0
+    adrp x8, here_ptr@page
+    add  x8, x8, here_ptr@pageoff
+    ldr  x9, [x8]
+    strb wzr, [x9]
+    mov  x0, x9
     ret
 
 // _wordlist_register: x0 = wid. Append if not already present and room remains.
@@ -4013,9 +4022,8 @@ _interpret_loop:
     cbnz x0, _abort
     bl   _file_echo_upto
     bl   _word
-    cbz  x0, _interpret_empty
     ldrb w1, [x0]
-    cbz  w1, _interpret_loop
+    cbz  w1, _interpret_empty       // empty counted string = end of SOURCE
 
     adrp x1, word_addr@page
     add  x1, x1, word_addr@pageoff
