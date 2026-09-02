@@ -30,6 +30,9 @@ Tag **[v0.5](https://github.com/Win32Forth/16Forth/releases/tag/v0.5)** remains 
 
 - **`RECURSE`**, `LIT` / `S"` / `C"` / `.(`, pictured numeric output, `MS@` / `ELAPSED`
 - **`FILE-ECHO`**, INCLUDE / FLOAD / FROMLIB, vocabularies
+- **`SEE` / `LOCATE`** — show `leaf:line` from VIEW stamps (`kernel.s`, `kernel.fth`, `ansfile.fth`, and later `INCLUDE`d sources)
+- **`WORDS`** — optional case-insensitive substring filter in high-level Forth (`WORDS` / `WORDS view`)
+- **`WORD`** — ANS-style: always a counted string at `HERE`; end of `SOURCE` → length 0 (never a null address)
 - Agent channel + `tools/16forth-agent`
 - App `Library/` (including ANSValidate when present) → `Contents/Resources/Library` for FROMLIB
 
@@ -100,7 +103,10 @@ Or invoke the bundle binary directly with `--agent`. Details: `16Forth/Docs/Agen
 : 2*  DUP + ;
 : SUM  0 SWAP 0 DO I + LOOP ;
 5 SUM . CR
-SEE SUM
+SEE SUM          \ body + leaf:line when VIEW known
+LOCATE DUP       \ leaf:line only (or "no source location")
+WORDS            \ list CONTEXT names
+WORDS view       \ names containing "view" (case-insensitive)
 .( hello) CR
 C" world" COUNT TYPE CR
 FILE-ECHO ON  FLOAD foo.fth

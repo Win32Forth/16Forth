@@ -144,7 +144,10 @@ The console `.app` goal above is met. **16ForthCLI is archived and inactive**; t
 | Control immediates | Asm `IF`…`THEN`, `BEGIN`…, `DO`/`?DO`/`LOOP`/`+LOOP` — threaded cells only. |
 | Loop indices | `I` / `J` / `K` as ordinary CODE. |
 | Startup | Banner **16Forth 0.6 ready**; app marketing version **0.6**. |
-| `SEE` / `HELP` | ITC decompiler; no leading `I`. |
+| `SEE` / `HELP` / `LOCATE` | ITC decompiler (no leading `I`); `SEE` and `LOCATE` print `leaf:line` from VIEW stamps when known. |
+| VIEW stamps | FLAGS bits 32–47 line, 48–62 file-id (64Forth-compatible). Boot CODE lines from `kernel.s`; `kernel.fth` / `ansfile.fth` / `INCLUDE` via `VIEW-REG` / `VIEW-STAMP`. Full editor VIEW still deferred. |
+| `WORDS` | Optional filter: `WORDS` or `WORDS <substr>` (case-insensitive substring of CONTEXT names) — high-level in `kernel.fth`, not assembly. |
+| `WORD` | Always returns counted string at `HERE`; EOL → length 0 (never null). |
 | Timing | `MS@` / `MS`; pictured `<# # #S #>` / `BASE`/`DECIMAL`/`HEX`; `ELAPSED` / `.ELAPSED`. |
 | INCLUDE / host files | `INCLUDED`/`INCLUDE`/`FLOAD`/`FROMLIB`, line-oriented `FILE-ECHO`, `\S`, `SOURCE`/`EVALUATE`/`REFILL`, `CHDIR`/`PWD`/`DIR`; Swift FileHost + KernelBridge; app `Library/` → Resources. |
 | Vocabularies | ANS Search-Order + 64Forth extras (as in 0.4). |
@@ -152,7 +155,7 @@ The console `.app` goal above is met. **16ForthCLI is archived and inactive**; t
 
 **Perf note:** Next serious lever vs 64Forth is TOS-in-register (`x20`), not more compiler expand.
 
-Still deferred vs a full 64Forth-class IDE: Hyper/VIEW/sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
+Still deferred vs a full 64Forth-class IDE: Hyper/editor VIEW, sealed vocabs, `DICT_THREADS` hashing, menus / icon, TOS-in-register.
 
 ## Status — v0.5 (historical)
 
