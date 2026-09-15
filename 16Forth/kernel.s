@@ -47,6 +47,9 @@
 .equ DICT_THREADS, 1
 .equ WORDLIST_REG_MAX, 128
 .equ SEARCH_ORDER_MAX, 8
+.equ LOCAL_MAX, 32
+.equ LOCAL_NAME_STR, 32
+.equ LOCAL_FRAME_MAX, 16
 
 // NEXT — inner interpreter dispatch
 // Typical M-series, L1 I/D hit, predicted indirect branch:
@@ -162,6 +165,9 @@ cfa_do:         .quad 0
 cfa_qdo:        .quad 0
 cfa_loop:       .quad 0
 cfa_plusloop:   .quad 0
+cfa_local_init: .quad 0
+cfa_local_at:   .quad 0
+cfa_local_store: .quad 0
 quit_ready:     .quad 0
 interp_lr:      .quad 0
 in_interpret:   .quad 0          // 1 while _interpret_run is active
@@ -177,6 +183,19 @@ pending_help_len:  .quad 0
 pending_help_buf:  .space 256    // NUL-terminated copy for _header_build
 .align 3
 cquote_pad:        .space 256    // interpret-mode C" counted string scratch
+// Locals (ANS): compile-time name table + runtime frames (from 64Forth)
+local_name_count:   .quad 0
+local_init_count:   .quad 0
+local_init_reverse: .quad 0
+local_brace_phase:  .quad 0      // {: phase: 0=args 1=vals 2=skip outs
+local_declaring:    .quad 0      // 1 while (LOCAL) sequence open
+.align 3
+local_names:        .skip LOCAL_MAX * LOCAL_NAME_STR
+local_frame_depth:  .quad 0
+.align 3
+local_frame_rsp:    .skip LOCAL_FRAME_MAX * 8
+local_frame_n:      .skip LOCAL_FRAME_MAX * 8
+local_frames:       .skip LOCAL_FRAME_MAX * LOCAL_MAX * 8
 source_id_var:  .quad 0          // 0=user/eval, -1=EVALUATE, 1=malloc INCLUDE, 2=host INCLUDE
 .equ SRC_MAX, 8
 .equ SRC_FRAME, 40               // addr,len,>IN,id,file_echo_pos
@@ -210,6 +229,14 @@ pwd_hook:           .quad 0
 dir_hook:           .quad 0
 emit_hook:          .quad 0      // void (*)(int c)
 emit_buf_hook:      .quad 0      // void (*)(const char *buf, size_t n)
+// BIG-INTEGER host (64Forth / ZForthSTC ABI; limb layout matches Library/BigInteger)
+bi_mul_hook:        .quad 0      // void (*)(int64 a, b, r)
+bi_divmod_hook:     .quad 0      // void (*)(int64 num, den, quot, rem)
+bi_isqrt_hook:      .quad 0      // void (*)(int64 a, r)
+host_tmp0:          .quad 0
+host_tmp1:          .quad 0
+host_tmp2:          .quad 0
+host_tmp3:          .quad 0
 view_file_n:        .quad 0
 view_src_id:        .quad 0            // current VIEW file-id (0=none)
 view_id_sp:         .quad 0
@@ -235,6 +262,7 @@ boot_word_table:
 
 BOOT_WORD "EXIT", "EXIT ( -- ) return from colon definition", 0, XEXIT, 228
 XEXIT:
+    bl   _local_frame_try_exit
     RPOP
     NEXT
 
@@ -444,6 +472,7 @@ _colon_common:
     adrp x3, DOCOL@page
     add  x3, x3, DOCOL@pageoff
     bl   _header_build
+    bl   _local_compile_reset
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
     mov  x1, #-1
@@ -460,6 +489,7 @@ XNONAME:
     adrp x3, DOCOL@page
     add  x3, x3, DOCOL@pageoff
     bl   _header_build
+    bl   _local_compile_reset
     adrp x0, last_cfa@page
     add  x0, x0, last_cfa@pageoff
     ldr  x0, [x0]
@@ -479,6 +509,7 @@ XSEMI:
     add  x0, x0, cfa_exit@pageoff
     ldr  x0, [x0]
     bl   _compile_cell
+    bl   _local_compile_reset
     // STATE = 0
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
@@ -548,11 +579,12 @@ XBEGIN:
 
 BOOT_WORD "AGAIN", "AGAIN ( addr -- )", FL_IMM, XAGAIN, 540
 XAGAIN:
-    DPOP x1                         // dest
+    // Compile BRANCH first; _compile_cell clobbers x1, so pop dest after.
     adrp x0, cfa_branch@page
     add  x0, x0, cfa_branch@pageoff
     ldr  x0, [x0]
     bl   _compile_cell
+    DPOP x1                         // dest (BEGIN addr)
     adrp x0, here_ptr@page
     add  x0, x0, here_ptr@pageoff
     ldr  x0, [x0]                   // offset cell addr
@@ -962,6 +994,14 @@ XZLT:
     ldr  x0, [x22]
     cmp  x0, #0
     csetm x0, lt
+    str  x0, [x22]
+    NEXT
+
+BOOT_WORD "0>", "0> ( n -- f ) positive?", 0, XZGT, 0
+XZGT:
+    ldr  x0, [x22]
+    cmp  x0, #0
+    csetm x0, gt
     str  x0, [x22]
     NEXT
 
@@ -2185,6 +2225,535 @@ XRSHIFT:
     DPUSH x0
     NEXT
 
+// ============================================================================
+// Locals (ANS-style from 64Forth ITC): {: … :}  TO  (LOCAL)  LOCAL-INIT
+// Runtime frames in BSS; compile-time names for current definition.
+// ITC: fetch/store compile as LIT idx (LOCAL@)/(LOCAL!). EXIT pops the frame.
+// Mixing >R/R> with locals is unsafe (RSP markers for frame exit).
+// ============================================================================
+
+BOOT_WORD "LOCAL-INIT", "LOCAL-INIT ( n nInit rev -- ) create locals frame", 0, XLOCAL_INIT, 0
+XLOCAL_INIT:
+    DPOP x2                        // reverse
+    DPOP x1                        // nInit
+    DPOP x0                        // nLocals
+    cmp  x0, #LOCAL_MAX
+    b.ls 1f
+    mov  x0, #LOCAL_MAX
+1:  cmp  x1, x0
+    b.ls 2f
+    mov  x1, x0
+2:  adrp x3, local_frame_depth@page
+    add  x3, x3, local_frame_depth@pageoff
+    ldr  x4, [x3]
+    cmp  x4, #LOCAL_FRAME_MAX
+    b.hs 9f
+    mov  x5, #LOCAL_MAX
+    mul  x5, x5, x4
+    lsl  x5, x5, #3
+    adrp x6, local_frames@page
+    add  x6, x6, local_frames@pageoff
+    add  x6, x6, x5
+    mov  x7, #0
+3:  cmp  x7, x0
+    b.hs 4f
+    str  xzr, [x6, x7, lsl #3]
+    add  x7, x7, #1
+    b    3b
+4:  cbz  x2, 5f
+    mov  x7, x1
+6:  cbz  x7, 7f
+    sub  x7, x7, #1
+    DPOP x8
+    str  x8, [x6, x7, lsl #3]
+    b    6b
+5:  mov  x7, #0
+8:  cmp  x7, x1
+    b.hs 7f
+    DPOP x8
+    str  x8, [x6, x7, lsl #3]
+    add  x7, x7, #1
+    b    8b
+7:  adrp x5, local_frame_rsp@page
+    add  x5, x5, local_frame_rsp@pageoff
+    str  x23, [x5, x4, lsl #3]
+    adrp x5, local_frame_n@page
+    add  x5, x5, local_frame_n@pageoff
+    str  x0, [x5, x4, lsl #3]
+    add  x4, x4, #1
+    str  x4, [x3]
+    NEXT
+9:  mov  x7, x1
+10: cbz  x7, 11f
+    DPOP x8
+    sub  x7, x7, #1
+    b    10b
+11: NEXT
+
+BOOT_WORD "(LOCAL@)", "(LOCAL@) ( idx -- x ) fetch local", 0, XLOCAL_AT, 0
+XLOCAL_AT:
+    DPOP x0
+    adrp x1, local_frame_depth@page
+    add  x1, x1, local_frame_depth@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 1f
+    sub  x1, x1, #1
+    mov  x2, #LOCAL_MAX
+    mul  x2, x2, x1
+    lsl  x2, x2, #3
+    adrp x3, local_frames@page
+    add  x3, x3, local_frames@pageoff
+    add  x3, x3, x2
+    adrp x2, local_frame_n@page
+    add  x2, x2, local_frame_n@pageoff
+    ldr  x2, [x2, x1, lsl #3]
+    cmp  x0, x2
+    b.hs 1f
+    ldr  x0, [x3, x0, lsl #3]
+    DPUSH x0
+    NEXT
+1:  DPUSH xzr
+    NEXT
+
+BOOT_WORD "(LOCAL!)", "(LOCAL!) ( x idx -- ) store local", 0, XLOCAL_STORE, 0
+XLOCAL_STORE:
+    DPOP x0                        // idx
+    DPOP x1                        // x
+    adrp x2, local_frame_depth@page
+    add  x2, x2, local_frame_depth@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 1f
+    sub  x2, x2, #1
+    mov  x3, #LOCAL_MAX
+    mul  x3, x3, x2
+    lsl  x3, x3, #3
+    adrp x4, local_frames@page
+    add  x4, x4, local_frames@pageoff
+    add  x4, x4, x3
+    adrp x3, local_frame_n@page
+    add  x3, x3, local_frame_n@pageoff
+    ldr  x3, [x3, x2, lsl #3]
+    cmp  x0, x3
+    b.hs 1f
+    str  x1, [x4, x0, lsl #3]
+1:  NEXT
+
+BOOT_WORD "(LOCAL)", "(LOCAL) ( c-addr u -- ) declare local or end locals", 0, XLOCAL_PAREN, 0
+XLOCAL_PAREN:
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    DPOP x1                        // u
+    DPOP x0                        // c-addr
+    bl   _local_paren
+9:  NEXT
+
+BOOT_WORD "{:", "{: ( -- ) declare locals {: args | vals -- outs :}", FL_IMM, XLOCAL_BRACE, 0
+XLOCAL_BRACE:
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    bl   _local_compile_reset
+    adrp x0, local_declaring@page
+    add  x0, x0, local_declaring@pageoff
+    str  xzr, [x0]
+    mov  x0, #1
+    adrp x1, local_init_reverse@page
+    add  x1, x1, local_init_reverse@pageoff
+    str  x0, [x1]
+    adrp x1, local_brace_phase@page
+    add  x1, x1, local_brace_phase@pageoff
+    str  xzr, [x1]
+_lb_loop:
+    bl   _next_word
+    cbz  x1, _lb_done
+    cmp  x1, #2
+    b.ne 1f
+    ldrb w2, [x0]
+    cmp  w2, #':'
+    b.ne 1f
+    ldrb w2, [x0, #1]
+    cmp  w2, #'}'
+    b.eq _lb_done
+1:  cmp  x1, #1
+    b.ne 2f
+    ldrb w2, [x0]
+    cmp  w2, #'|'
+    b.ne 2f
+    mov  x2, #1
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    str  x2, [x3]
+    b    _lb_loop
+2:  cmp  x1, #2
+    b.ne 3f
+    ldrb w2, [x0]
+    cmp  w2, #'-'
+    b.ne 3f
+    ldrb w2, [x0, #1]
+    cmp  w2, #'-'
+    b.ne 3f
+    mov  x2, #2
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    str  x2, [x3]
+    b    _lb_loop
+3:  adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    ldr  x3, [x3]
+    cmp  x3, #2
+    b.eq _lb_loop
+    bl   _local_add_name
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    ldr  x3, [x3]
+    cbnz x3, _lb_loop
+    adrp x2, local_init_count@page
+    add  x2, x2, local_init_count@pageoff
+    ldr  x3, [x2]
+    add  x3, x3, #1
+    str  x3, [x2]
+    b    _lb_loop
+_lb_done:
+    bl   _local_finalize_compile
+9:  NEXT
+
+BOOT_WORD "LOCALS|", "LOCALS| ( name... | -- ) declare locals (immediate)", FL_IMM, XLOCALS_BAR, 0
+XLOCALS_BAR:
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+_ls_loop:
+    bl   _next_word
+    cbz  x1, _ls_end
+    cmp  x1, #1
+    b.ne 1f
+    ldrb w2, [x0]
+    cmp  w2, #'|'
+    b.eq _ls_end
+1:  bl   _local_paren
+    b    _ls_loop
+_ls_end:
+    mov  x0, #0
+    mov  x1, #0
+    bl   _local_paren
+9:  NEXT
+
+BOOT_WORD "TO", "TO ( x \"name\" -- ) store to VALUE or local (immediate)", FL_IMM, XTO_IMM, 0
+XTO_IMM:
+    bl   _next_word
+    cbz  x1, 9f
+    stp  x0, x1, [sp, #-16]!
+    adrp x2, state_var@page
+    add  x2, x2, state_var@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 1f
+    bl   _local_lookup
+    cmp  x0, #-1
+    b.eq 1f
+    add  sp, sp, #16
+    bl   _compile_lit
+    adrp x0, cfa_local_store@page
+    add  x0, x0, cfa_local_store@pageoff
+    ldr  x0, [x0]
+    bl   _compile_cell
+    b    9f
+1:  ldp  x0, x1, [sp], #16
+    bl   _find_chars
+    cbz  x0, 9f
+    add  x0, x0, #16
+    adrp x2, state_var@page
+    add  x2, x2, state_var@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 2f
+    bl   _compile_lit
+    adrp x0, cnt_store@page
+    add  x0, x0, cnt_store@pageoff
+    bl   _find
+    cbz  x0, 9f
+    bl   _compile_cell
+    b    9f
+2:  DPOP x1
+    str  x1, [x0]
+9:  NEXT
+
+BOOT_WORD "(LOCAL-FRAME-EXIT)", "(LOCAL-FRAME-EXIT) ( -- ) pop locals frame if RSP matches", 0, XLOCAL_FRAME_EXIT, 0
+XLOCAL_FRAME_EXIT:
+    bl   _local_frame_try_exit
+    NEXT
+
+// --- locals helpers ---
+
+_local_compile_reset:
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    str  xzr, [x0]
+    adrp x0, local_init_count@page
+    add  x0, x0, local_init_count@pageoff
+    str  xzr, [x0]
+    adrp x0, local_init_reverse@page
+    add  x0, x0, local_init_reverse@pageoff
+    str  xzr, [x0]
+    adrp x0, local_declaring@page
+    add  x0, x0, local_declaring@pageoff
+    str  xzr, [x0]
+    ret
+
+// _local_paren: x0=c-addr, x1=u  (compile-time; u=0 ends sequence)
+_local_paren:
+    stp  x29, x30, [sp, #-16]!
+    cbz  x1, _lparen_last
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    ldr  x3, [x2]
+    cbnz x3, 1f
+    stp  x0, x1, [sp, #-16]!
+    bl   _local_compile_reset
+    ldp  x0, x1, [sp], #16
+    adrp x3, local_init_reverse@page
+    add  x3, x3, local_init_reverse@pageoff
+    str  xzr, [x3]
+    mov  x3, #1
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    str  x3, [x2]
+1:  bl   _local_add_name
+    adrp x2, local_init_count@page
+    add  x2, x2, local_init_count@pageoff
+    ldr  x3, [x2]
+    add  x3, x3, #1
+    str  x3, [x2]
+    b    9f
+_lparen_last:
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    ldr  x3, [x2]
+    cbnz x3, 2f
+    bl   _local_compile_reset
+    adrp x3, local_init_reverse@page
+    add  x3, x3, local_init_reverse@pageoff
+    str  xzr, [x3]
+2:  bl   _local_finalize_compile
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    str  xzr, [x2]
+9:  ldp  x29, x30, [sp], #16
+    ret
+
+_local_add_name:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    mov  x19, x0
+    mov  x20, x1
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x1, [x0]
+    cmp  x1, #LOCAL_MAX
+    b.hs 9f
+    mov  x2, #LOCAL_NAME_STR
+    mul  x2, x2, x1
+    adrp x3, local_names@page
+    add  x3, x3, local_names@pageoff
+    add  x3, x3, x2
+    cmp  x20, #31
+    b.ls 1f
+    mov  x20, #31
+1:  strb w20, [x3], #1
+    mov  x2, #0
+2:  cmp  x2, x20
+    b.hs 3f
+    ldrb w4, [x19, x2]
+    cmp  w4, #'a'
+    b.lo 21f
+    cmp  w4, #'z'
+    b.hi 21f
+    sub  w4, w4, #32
+21: strb w4, [x3, x2]
+    add  x2, x2, #1
+    b    2b
+3:  adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+_local_lookup:
+    stp  x19, x20, [sp, #-32]!
+    stp  x21, xzr, [sp, #16]
+    mov  x19, x0
+    mov  x20, x1
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x21, [x0]
+    mov  x0, #0
+1:  cmp  x0, x21
+    b.hs 8f
+    mov  x2, #LOCAL_NAME_STR
+    mul  x2, x2, x0
+    adrp x3, local_names@page
+    add  x3, x3, local_names@pageoff
+    add  x3, x3, x2
+    ldrb w2, [x3], #1
+    cmp  x2, x20
+    b.ne 3f
+    mov  x4, #0
+2:  cmp  x4, x20
+    b.hs 10f
+    ldrb w5, [x3, x4]
+    ldrb w6, [x19, x4]
+    cmp  w6, #'a'
+    b.lo 21f
+    cmp  w6, #'z'
+    b.hi 21f
+    sub  w6, w6, #32
+21: cmp  w5, w6
+    b.ne 3f
+    add  x4, x4, #1
+    b    2b
+3:  add  x0, x0, #1
+    b    1b
+8:  mov  x0, #-1
+10: ldp  x21, xzr, [sp, #16]
+    ldp  x19, x20, [sp], #32
+    ret
+
+_compile_lit:
+    stp  x0, x30, [sp, #-16]!
+    adrp x0, cfa_lit@page
+    add  x0, x0, cfa_lit@pageoff
+    ldr  x0, [x0]
+    bl   _compile_cell
+    ldr  x0, [sp]
+    bl   _compile_cell
+    ldp  x0, x30, [sp], #16
+    ret
+
+_local_finalize_compile:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, local_init_count@page
+    add  x0, x0, local_init_count@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, local_init_reverse@page
+    add  x0, x0, local_init_reverse@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, cfa_local_init@page
+    add  x0, x0, cfa_local_init@pageoff
+    ldr  x0, [x0]
+    bl   _compile_cell
+    ldp  x29, x30, [sp], #16
+    ret
+
+_local_frame_try_exit:
+    adrp x0, local_frame_depth@page
+    add  x0, x0, local_frame_depth@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 1f
+    sub  x1, x1, #1
+    adrp x2, local_frame_rsp@page
+    add  x2, x2, local_frame_rsp@pageoff
+    ldr  x2, [x2, x1, lsl #3]
+    cmp  x2, x23
+    b.ne 1f
+    str  x1, [x0]
+1:  ret
+
+// Parse next whitespace word into name_buf. Out: x0=addr, x1=len (0=EOF).
+// Does not touch HERE (safe while compiling).
+_next_word:
+    adrp x1, source_addr@page
+    add  x1, x1, source_addr@pageoff
+    ldr  x1, [x1]
+    adrp x2, source_len@page
+    add  x2, x2, source_len@pageoff
+    ldr  x2, [x2]
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x4, [x3]
+_nw_skip:
+    cmp  x4, x2
+    b.hs _nw_eof
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.hi _nw_start
+    add  x4, x4, #1
+    b    _nw_skip
+_nw_start:
+    mov  x6, x4
+_nw_scan:
+    cmp  x4, x2
+    b.hs _nw_got
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.ls _nw_got
+    add  x4, x4, #1
+    b    _nw_scan
+_nw_got:
+    sub  x7, x4, x6
+    cmp  x4, x2
+    b.hs 1f
+    add  x4, x4, #1
+1:  str  x4, [x3]
+    cbz  x7, _nw_eof
+    cmp  x7, #255
+    b.ls 2f
+    mov  x7, #255
+2:  adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    mov  x8, #0
+3:  cmp  x8, x7
+    b.hs 4f
+    ldrb w5, [x1, x6]
+    add  x6, x6, #1
+    strb w5, [x0, x8]
+    add  x8, x8, #1
+    b    3b
+4:  mov  x1, x7
+    ret
+_nw_eof:
+    str  x4, [x3]
+    mov  x0, #0
+    mov  x1, #0
+    ret
+
+// _find_chars: x0=addr, x1=len → same as _find on a counted uppercase copy.
+_find_chars:
+    stp  x29, x30, [sp, #-16]!
+    sub  sp, sp, #256
+    cmp  x1, #255
+    b.ls 1f
+    mov  x1, #255
+1:  mov  x2, sp
+    strb w1, [x2], #1
+    mov  x3, #0
+2:  cmp  x3, x1
+    b.hs 3f
+    ldrb w4, [x0, x3]
+    cmp  w4, #'a'
+    b.lo 21f
+    cmp  w4, #'z'
+    b.hi 21f
+    sub  w4, w4, #32
+21: strb w4, [x2, x3]
+    add  x3, x3, #1
+    b    2b
+3:  mov  x0, sp
+    bl   _find
+    add  sp, sp, #256
+    ldp  x29, x30, [sp], #16
+    ret
+
 // SEE helpers: push cached xts / DOCOL code address (avoid awkward names in .fth)
 BOOT_WORD "LIT-ADDR", "LIT-ADDR ( -- xt ) xt of LIT (for SEE)", 0, XLIT_ADDR, 2177
 XLIT_ADDR:
@@ -2444,6 +3013,121 @@ XVIEW_STAMP:
     str  x0, [x1, #-8]
 1:  NEXT
 
+// ============================================================================
+// Memory-Allocation + BIG-INTEGER host CODE (PI / BigInteger libraries)
+// Stack is memory-only (DPOP); end with NEXT.
+// ============================================================================
+
+// ALLOCATE ( u -- a-addr ior )  libc malloc; ior 0 ok, -1 fail
+BOOT_WORD "ALLOCATE", "ALLOCATE ( u -- a-addr ior ) allocate u bytes", 0, XALLOCATE, 0
+XALLOCATE:
+    DPOP x0
+    cbnz x0, 1f
+    mov  x0, #1
+1:  SAVE_C_CALLEE
+    bl   _malloc
+    RESTORE_C_CALLEE
+    mov  x1, x0                    // a-addr
+    mov  x2, #0                    // ior
+    cbnz x1, 2f
+    mov  x2, #-1
+2:  DPUSH x1
+    DPUSH x2
+    NEXT
+
+// FREE ( a-addr -- ior )
+BOOT_WORD "FREE", "FREE ( a-addr -- ior ) free ALLOCATE block", 0, XFREE, 0
+XFREE:
+    DPOP x0
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    bl   _free
+    RESTORE_C_CALLEE
+1:  mov  x0, #0
+    DPUSH x0
+    NEXT
+
+// BI-MUL ( a b r -- )
+BOOT_WORD "BI-MUL", "BI-MUL ( a b r -- ) BIG-INTEGER host multiply", 0, XBIMUL, 0
+XBIMUL:
+    DPOP x2                        // r
+    DPOP x1                        // b
+    DPOP x0                        // a
+    adrp x3, host_tmp0@page
+    add  x3, x3, host_tmp0@pageoff
+    str  x0, [x3]
+    str  x1, [x3, #8]
+    str  x2, [x3, #16]
+    adrp x3, bi_mul_hook@page
+    add  x3, x3, bi_mul_hook@pageoff
+    ldr  x9, [x3]
+    cbz  x9, 1f
+    adrp x3, host_tmp0@page
+    add  x3, x3, host_tmp0@pageoff
+    ldr  x0, [x3]
+    ldr  x1, [x3, #8]
+    ldr  x2, [x3, #16]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  NEXT
+
+// BI-DIVMOD ( num den quot rem work -- )  work ignored
+BOOT_WORD "BI-DIVMOD", "BI-DIVMOD ( num den quot rem work -- ) BIG-INTEGER host divmod", 0, XBIDIVMOD, 0
+XBIDIVMOD:
+    DPOP x0                        // work (ignore)
+    DPOP x3                        // rem
+    DPOP x2                        // quot
+    DPOP x1                        // den
+    DPOP x0                        // num
+    adrp x4, host_tmp0@page
+    add  x4, x4, host_tmp0@pageoff
+    str  x0, [x4]
+    str  x1, [x4, #8]
+    str  x2, [x4, #16]
+    str  x3, [x4, #24]
+    adrp x0, bi_divmod_hook@page
+    add  x0, x0, bi_divmod_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x4, host_tmp0@page
+    add  x4, x4, host_tmp0@pageoff
+    ldr  x0, [x4]
+    ldr  x1, [x4, #8]
+    ldr  x2, [x4, #16]
+    ldr  x3, [x4, #24]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  NEXT
+
+// BI-ISQRT ( a r quot rem work t1 t2 -- )  scratch ignored
+BOOT_WORD "BI-ISQRT", "BI-ISQRT ( a r quot rem work t1 t2 -- ) BIG-INTEGER host isqrt", 0, XBIISQRT, 0
+XBIISQRT:
+    DPOP x0                        // t2
+    DPOP x0                        // t1
+    DPOP x0                        // work
+    DPOP x0                        // rem
+    DPOP x0                        // quot
+    DPOP x1                        // r
+    DPOP x0                        // a
+    adrp x2, host_tmp0@page
+    add  x2, x2, host_tmp0@pageoff
+    str  x0, [x2]
+    str  x1, [x2, #8]
+    adrp x0, bi_isqrt_hook@page
+    add  x0, x0, bi_isqrt_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x2, host_tmp0@page
+    add  x2, x2, host_tmp0@pageoff
+    ldr  x0, [x2]
+    ldr  x1, [x2, #8]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  NEXT
+
 .section __DATA,__bootword,regular
 .quad 0, 0, 0, 0, 0
 // Inner interpreter runtimes
@@ -2551,6 +3235,27 @@ _kernel_set_pwd:
 _kernel_set_dir:
     adrp x1, dir_hook@page
     add  x1, x1, dir_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_mul
+_kernel_set_bi_mul:
+    adrp x1, bi_mul_hook@page
+    add  x1, x1, bi_mul_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_divmod
+_kernel_set_bi_divmod:
+    adrp x1, bi_divmod_hook@page
+    add  x1, x1, bi_divmod_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_isqrt
+_kernel_set_bi_isqrt:
+    adrp x1, bi_isqrt_hook@page
+    add  x1, x1, bi_isqrt_hook@pageoff
     str  x0, [x1]
     ret
 
@@ -4001,6 +4706,24 @@ _boot_cache:
     add  x1, x1, cfa_plusloop@pageoff
     bl   _cache_one
 
+    adrp x0, cnt_local_init@page
+    add  x0, x0, cnt_local_init@pageoff
+    adrp x1, cfa_local_init@page
+    add  x1, x1, cfa_local_init@pageoff
+    bl   _cache_one
+
+    adrp x0, cnt_local_at@page
+    add  x0, x0, cnt_local_at@pageoff
+    adrp x1, cfa_local_at@page
+    add  x1, x1, cfa_local_at@pageoff
+    bl   _cache_one
+
+    adrp x0, cnt_local_store@page
+    add  x0, x0, cnt_local_store@pageoff
+    adrp x1, cfa_local_store@page
+    add  x1, x1, cfa_local_store@pageoff
+    bl   _cache_one
+
     ldp  x29, x30, [sp], #16
     ret
 
@@ -4029,6 +4752,32 @@ _interpret_loop:
     add  x1, x1, word_addr@pageoff
     str  x0, [x1]
 
+    // Compile-time locals: name → LIT idx (LOCAL@)
+    adrp x2, state_var@page
+    add  x2, x2, state_var@pageoff
+    ldr  x2, [x2]
+    cbz  x2, _interp_find
+    adrp x2, local_name_count@page
+    add  x2, x2, local_name_count@pageoff
+    ldr  x2, [x2]
+    cbz  x2, _interp_find
+    ldrb w1, [x0]
+    cbz  w1, _interp_find
+    add  x0, x0, #1
+    bl   _local_lookup
+    cmp  x0, #-1
+    b.eq _interp_local_miss
+    bl   _compile_lit
+    adrp x0, cfa_local_at@page
+    add  x0, x0, cfa_local_at@pageoff
+    ldr  x0, [x0]
+    bl   _compile_cell
+    b    _interpret_loop
+_interp_local_miss:
+    adrp x0, word_addr@page
+    add  x0, x0, word_addr@pageoff
+    ldr  x0, [x0]
+_interp_find:
     bl   _find
     cbz  x0, _try_num
 
@@ -4493,3 +5242,11 @@ cnt_do:         .byte 4, '(','D','O',')'
 cnt_qdo:        .byte 5, '(','?','D','O',')'
 cnt_loop:       .byte 6, '(','L','O','O','P',')'
 cnt_plusloop:   .byte 7, '(','+','L','O','O','P',')'
+.align 3
+cnt_local_init: .byte 10, 'L','O','C','A','L','-','I','N','I','T'
+.align 3
+cnt_local_at:   .byte 8, '(','L','O','C','A','L','@',')'
+.align 3
+cnt_local_store: .byte 8, '(','L','O','C','A','L','!',')'
+.align 3
+cnt_store:      .byte 1, '!'

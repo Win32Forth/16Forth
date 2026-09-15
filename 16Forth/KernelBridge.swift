@@ -77,6 +77,21 @@ private func kernel_set_dir(
     _ fn: (@convention(c) (UnsafePointer<CChar>?, Int) -> Void)?
 )
 
+@_silgen_name("kernel_set_bi_mul")
+private func kernel_set_bi_mul(
+    _ fn: (@convention(c) (Int64, Int64, Int64) -> Void)?
+)
+
+@_silgen_name("kernel_set_bi_divmod")
+private func kernel_set_bi_divmod(
+    _ fn: (@convention(c) (Int64, Int64, Int64, Int64) -> Void)?
+)
+
+@_silgen_name("kernel_set_bi_isqrt")
+private func kernel_set_bi_isqrt(
+    _ fn: (@convention(c) (Int64, Int64) -> Void)?
+)
+
 @_silgen_name("kernel_take_repl_batch_stop")
 private func kernel_take_repl_batch_stop() -> Int32
 
@@ -170,6 +185,18 @@ private let kernelDirTrampoline: @convention(c) (UnsafePointer<CChar>?, Int) -> 
     }
 }
 
+private let kernelBiMulTrampoline: @convention(c) (Int64, Int64, Int64) -> Void = { a, b, r in
+    BigIntHost.mul(a: a, b: b, r: r)
+}
+
+private let kernelBiDivmodTrampoline: @convention(c) (Int64, Int64, Int64, Int64) -> Void = { num, den, quot, rem in
+    BigIntHost.divmod(num: num, den: den, quot: quot, rem: rem)
+}
+
+private let kernelBiIsqrtTrampoline: @convention(c) (Int64, Int64) -> Void = { a, r in
+    BigIntHost.isqrt(a: a, r: r)
+}
+
 final class KernelBridge {
     static let shared = KernelBridge()
 
@@ -224,6 +251,9 @@ final class KernelBridge {
         kernel_set_chdir(kernelChdirTrampoline)
         kernel_set_pwd(kernelPwdTrampoline)
         kernel_set_dir(kernelDirTrampoline)
+        kernel_set_bi_mul(kernelBiMulTrampoline)
+        kernel_set_bi_divmod(kernelBiDivmodTrampoline)
+        kernel_set_bi_isqrt(kernelBiIsqrtTrampoline)
     }
 
     /// Start the engine once (JIT buffer + cold start). Safe to call repeatedly.

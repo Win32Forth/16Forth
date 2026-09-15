@@ -47,6 +47,12 @@ VOCABULARY BIG-INTEGER
 VOCABULARY EDITOR
 VOCABULARY ASSEMBLER
 VOCABULARY FP
+VOCABULARY GRAPHICS
+\ Minimal GRAPHICS stubs so PI/PIMAIN can load without AppKit words.
+ALSO GRAPHICS DEFINITIONS
+: CLS ;
+: KEY  0 ;
+PREVIOUS DEFINITIONS
 ONLY FORTH DEFINITIONS
 
 DOC" FALSE ( -- 0 )"
@@ -210,6 +216,20 @@ DOC" >HELP ( xt -- hfa ) help counted string"
 : >HELP  HFA ;
 DOC" >BODY ( xt -- a-addr ) parameter field (CFA+8)"
 : >BODY  8 + ;
+
+\ DEFER / IS — after ['] and >BODY (DEFER compiles ['] ABORT; DEFER@ uses >BODY).
+\ Layout matches CONSTANT (data at >BODY CELL+ under CREATE/DOES>).
+DOC" DEFER ( 'name' -- ) create deferred word (default ABORT; set with IS)"
+: DEFER  CREATE ['] ABORT , DOES> @ EXECUTE ;
+DOC" DEFER@ ( xt1 -- xt2 ) xt currently executed by deferred xt1"
+: DEFER@  >BODY CELL+ @ ;
+DOC" DEFER! ( xt1 xt2 -- ) set deferred xt2 to execute xt1"
+: DEFER!  >BODY CELL+ ! ;
+DOC" IS ( xt 'name' -- ) set deferred name (immediate)"
+: IS  STATE @ IF POSTPONE ['] POSTPONE DEFER! ELSE ' DEFER! THEN ; IMMEDIATE
+DOC" ACTION-OF ( 'name' -- xt ) xt currently in deferred name (immediate)"
+: ACTION-OF  STATE @ IF POSTPONE ['] POSTPONE DEFER@ ELSE ' DEFER@ THEN ; IMMEDIATE
+
 DOC" ALIGNED ( addr -- a-addr ) align upward to cell"
 : ALIGNED  7 + 7 INVERT AND ;
 DOC" ALIGN ( -- ) align HERE to cell boundary"

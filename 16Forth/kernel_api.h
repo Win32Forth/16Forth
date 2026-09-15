@@ -45,6 +45,11 @@ void kernel_set_pwd(void (*fn)(void));
 /// DIR — path_len == 0 → list cwd (or Library if FROMLIB armed).
 void kernel_set_dir(void (*fn)(const char *path, size_t n));
 
+/// BIG-INTEGER host (same ABI as 64Forth / ZForth / BigIntHost).
+void kernel_set_bi_mul(void (*fn)(int64_t a, int64_t b, int64_t r));
+void kernel_set_bi_divmod(void (*fn)(int64_t num, int64_t den, int64_t quot, int64_t rem));
+void kernel_set_bi_isqrt(void (*fn)(int64_t a, int64_t r));
+
 /// \S on console SOURCE: sticky flag for multi-line paste stop.
 /// Returns 1 if set since last call, else 0; always clears.
 int kernel_take_repl_batch_stop(void);
