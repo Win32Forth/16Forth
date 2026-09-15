@@ -2901,7 +2901,7 @@ XMSFETCH:
     adrp x2, timeval_buf@page
     add  x2, x2, timeval_buf@pageoff
     ldr  x0, [x2]                   // tv_sec
-    ldr  x1, [x2, #8]               // tv_usec
+    ldr  w1, [x2, #8]               // tv_usec (32-bit; ignore 4-byte pad)
     mov  x2, #1000
     mul  x0, x0, x2
     udiv x1, x1, x2
